@@ -99,6 +99,16 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   wolfSSL_SetIOReadCtx(ssl, &_transport);
   wolfSSL_SetIOWriteCtx(ssl, &_transport);
   wolfSSL_UseSNI(ssl, WOLFSSL_SNI_HOST_NAME, host, strlen(host));
+#ifdef HAVE_MAX_FRAGMENT
+  // Negotiate 2KB TLS records (RFC 6066 max_fragment_length). wolfSSL sizes its
+  // receive/output buffers to the negotiated fragment, so this drops the default
+  // ~17KB contiguous record alloc to ~2KB -- the KOSync stats handshake fits the
+  // fragmented ~17KB largest-block the X3 leaves after WiFi + prior sync legs,
+  // instead of failing MEMORY_E and rebooting. WOLFSSL_MFL_2_11 = 2^11 = 2048.
+  // Best-effort: a server that ignores the extension keeps full-size records and
+  // the handshake proceeds as before, so this can't regress a non-supporting peer.
+  wolfSSL_UseMaxFragment(ssl, WOLFSSL_MFL_2_11);
+#endif
 #if defined(WOLFSSL_TLS13) && defined(HAVE_CURVE25519)
   // MEMFIX-PORT: pin the TLS 1.3 key_share to X25519. wolfSSL's default is a
   // P-256 share, generated with fast-math bignums that WOLFSSL_SMALL_STACK
