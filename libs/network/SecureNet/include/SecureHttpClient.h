@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <new>
 #include <string>
 #include <utility>
 #include <vector>
@@ -114,6 +115,9 @@ class SecureHttpClient {
     _headers.clear();
     _body.clear();
     _status = 0;
+    // Buy the response-header table now, before the connect: this is the healthiest heap
+    // this request will see, and after this point the table never grows. See storeHeader().
+    reserveHeaderTable();
     return parseUrl(url, _scheme, _host, _path, _port);
   }
   // Closes the kept-alive connection (if any). Call when done with a server;
@@ -242,7 +246,7 @@ class SecureHttpClient {
         while (!value.empty() && value.front() == ' ') value.erase(value.begin());
         std::transform(name.begin(), name.end(), name.begin(),
                        [](unsigned char c) { return static_cast<char>(tolower(c)); });
-        _responseHeaders.push_back(Header{name, value});
+        storeHeader(name, value);
         if (name == "content-length") {
           _contentLength = static_cast<size_t>(strtoul(value.c_str(), nullptr, 10));
           _haveContentLength = true;
@@ -300,6 +304,11 @@ class SecureHttpClient {
   int getStatus() const { return _status; }
   int getSize() const { return static_cast<int>(_body.size()); }
   bool responseComplete() const { return _bodyComplete; }
+
+  // wolfSSL error that ended the last TLS session, 0 if none (or on a plain-HTTP hop).
+  // Pair it with !responseComplete() to say WHY a body stopped early — see
+  // SecureClient::lastReadError().
+  int lastTlsError() const { return _secure.lastReadError(); }
   bool callbackAborted() const { return _callbackAborted; }
   bool aborted() const { return _aborted; }
   bool hasContentLength() const { return _haveContentLength; }
@@ -358,6 +367,39 @@ class SecureHttpClient {
 
   static bool isRedirectStatus(int status) {
     return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+  }
+
+  // Pre-size the response-header table, without the throwing allocation reserve() itself
+  // makes. std::vector growth goes through the plain operator new, and with -fno-exceptions
+  // a failure there calls abort(): the device reboots instead of failing the request. That
+  // is not theoretical — an X3 capture (crash_report.txt) panicked in exactly this
+  // push_back, reading a plain-HTTP OPDS feed with 3512 bytes free and a 756-byte largest
+  // block, on the routine 8 -> 16 growth (MAX_STORED_HEADERS * sizeof(Header) = 768).
+  //
+  // Probing with the nothrow operator new first means a heap too tight for the table leaves
+  // capacity as-is instead of aborting; storeHeader() then simply retains fewer headers.
+  void reserveHeaderTable() {
+    if (_responseHeaders.capacity() >= MAX_STORED_HEADERS) return;
+    void* probe = ::operator new(MAX_STORED_HEADERS * sizeof(Header), std::nothrow);
+    if (probe == nullptr) return;
+    ::operator delete(probe, std::nothrow);
+    _responseHeaders.reserve(MAX_STORED_HEADERS);
+  }
+
+  // Retain a header for getHeader()/getHeaders(), never reallocating.
+  //
+  // The count of headers is chosen by the peer, so an unbounded push_back hands a remote
+  // server the ability to abort the device at the lowest-heap moment of a request. Storing
+  // only while spare capacity exists makes that impossible by construction, which is the
+  // guarantee a nothrow reserve alone cannot give (its probe can be raced).
+  //
+  // Dropping past the cap is safe for framing: content-length, transfer-encoding and
+  // connection are consumed inline by the parse loop and never read back from this table.
+  // Only getHeader() lookups (in this firmware, "location") can miss, and a missed Location
+  // fails the redirect with an error rather than a panic.
+  void storeHeader(const std::string& name, const std::string& value) {
+    if (_responseHeaders.size() >= _responseHeaders.capacity()) return;
+    _responseHeaders.push_back(Header{name, value});
   }
 
   static bool parseUrl(const std::string& url, std::string& scheme, std::string& host, std::string& path,
@@ -568,6 +610,10 @@ class SecureHttpClient {
   // body readers, so kept modest.
   static constexpr size_t READ_CHUNK = 2048;
   static constexpr size_t MAX_LINE = 4096;  // header / chunk-size line cap
+  // Response headers retained per response. 16 is the measured requirement, not a guess:
+  // it is the capacity the X3 capture was growing into when it panicked, and several times
+  // what the OPDS and sync servers in use here actually send. See storeHeader().
+  static constexpr size_t MAX_STORED_HEADERS = 16;
 
   // Kept-alive connection state. _conn points at _secure or _plain while a
   // connection is held open, and null otherwise.

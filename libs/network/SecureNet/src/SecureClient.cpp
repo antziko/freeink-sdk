@@ -5,6 +5,11 @@
 // integration point for the TLS 1.3 transport.
 #if defined(FREEINK_NET_WOLFSSL)
 #include <wolfssl/ssl.h>
+#include <wolfssl/wolfcrypt/memory.h>
+
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 #endif
 
 namespace freeink {
@@ -56,6 +61,7 @@ bool isWantIo(const int err) {
 }  // namespace
 
 int SecureClient::connectWithMethod(const char* host, uint16_t port, void* method, const char* label) {
+  _lastReadErr = 0;  // per-connection: never report a previous session's death
 #if defined(FREEINK_WOLFSSL_DEBUG)
   // Routes wolfSSL's internal trace through wolfSSL_Arduino_Serial_Print (the
   // application provides that hook). Shows exactly where a handshake stalls.
@@ -191,7 +197,10 @@ int SecureClient::read(uint8_t* buf, size_t size) {
   }
   // A mid-stream failure is invisible to callers (they just see the connection
   // die); the error code distinguishes an OOM (MEMORY_E -125) from a peer
-  // drop or MAC failure.
+  // drop or MAC failure. Recorded as well as printed: the Serial line below is
+  // dead weight on a device with no cable, which is exactly where these failures
+  // are reported from, so lastReadError() is what actually reaches a log.
+  _lastReadErr = err;
   if (Serial) Serial.printf("[SecureClient] read failed: %d, free heap %u\n", err, (unsigned)ESP.getFreeHeap());
   _connected = false;
   return -1;
@@ -211,7 +220,130 @@ void SecureClient::stop() {
 
 uint8_t SecureClient::connected() { return _connected && _transport.connected(); }
 
+// --- TlsRecordSlab (see SecureClient.h for why this exists) ---
+
+namespace {
+// GetInputData() calls GrowInputBuffer(ssl, curSize, usedLength), which asks for
+// curSize + usedLength + align: MAX_RECORD_SIZE is 16384 (internal.h:2292), align is at
+// most 16 (settings.h:2320), and usedLength at the growing call is the few header bytes
+// left over from the previous read, so 1KB of headroom covers it.
+//
+// The exact figure is 17408 because that is measured, not guessed: the reservation this
+// replaces asked for 17408 bytes at this same point in 38 consecutive device transfers
+// and got it every time. Going bigger for extra headroom would trade a certainty for a
+// maybe — if the block cannot be bought the whole mechanism is inactive.
+constexpr size_t SLAB_SIZE = 16384 + 1024;
+// Only divert requests big enough to be a record buffer. Handing the block to a 2KB
+// caller would strand it for the rest of the transfer, which is the failure this is
+// meant to prevent.
+constexpr size_t SLAB_MIN_REQUEST = 8192;
+
+uint8_t* g_slab = nullptr;
+std::atomic<bool> g_slabBusy{false};
+uint32_t g_slabHits = 0;
+uint32_t g_slabMisses = 0;
+// Largest request that was in the band but could not be served, and the largest that
+// overshot SLAB_SIZE entirely. If a capture ever shows tlsErr=-125 with slabHit>0 and
+// slabOver>0, SLAB_SIZE is the thing to change — without this the two are guesswork.
+uint32_t g_slabMaxMiss = 0;
+uint32_t g_slabMaxOver = 0;
+// Atomic so that two leases taken from different tasks cannot race the refcount down to
+// zero twice and free the block while a session still points at it. The counters above
+// are diagnostics only and are left plain.
+std::atomic<int> g_slabLeases{0};
+
+// wolfSSL_SetAllocators takes plain C signatures (no WOLFSSL_STATIC_MEMORY and no
+// WOLFSSL_DEBUG_MEMORY in this build), and wolfSSL_Malloc/Free/Realloc route through
+// them for every XMALLOC/XFREE/XREALLOC in the library.
+void* slabMalloc(size_t size) {
+  if (size >= SLAB_MIN_REQUEST && g_slab) {
+    if (size > SLAB_SIZE) {
+      if (size > g_slabMaxOver) g_slabMaxOver = static_cast<uint32_t>(size);
+    } else if (!g_slabBusy.exchange(true)) {
+      // exchange, not a read-then-write: the claim has to be atomic or two owners could
+      // walk away with the same block. Uncontended here (one TLS session at a time), so
+      // this costs a single instruction on the record path.
+      ++g_slabHits;
+      return g_slab;
+    } else {
+      ++g_slabMisses;
+      if (size > g_slabMaxMiss) g_slabMaxMiss = static_cast<uint32_t>(size);
+    }
+  }
+  return malloc(size);
+}
+
+void slabFree(void* ptr) {
+  if (ptr == nullptr) return;
+  if (ptr == g_slab) {
+    g_slabBusy.store(false);
+    return;
+  }
+  free(ptr);
+}
+
+void* slabRealloc(void* ptr, size_t size) {
+  if (ptr != g_slab) return realloc(ptr, size);
+  // wolfSSL grows the record buffer with XMALLOC + XMEMCPY rather than XREALLOC, so this
+  // is not expected to fire — but realloc() must never be handed a pointer it does not
+  // own. Copy out and give the block back instead.
+  void* out = malloc(size);
+  if (out) {
+    memcpy(out, g_slab, size < SLAB_SIZE ? size : SLAB_SIZE);
+    g_slabBusy.store(false);
+  }
+  return out;
+}
+}  // namespace
+
+TlsRecordSlab::TlsRecordSlab() {
+  if (g_slab == nullptr && g_slabLeases.load() == 0) {
+    // Raw malloc rather than makeUniqueNoThrow: the pointer is handed to wolfSSL's C
+    // allocator hooks and has to outlive every scope here, so there is no owner to give
+    // it to. Freed in the destructor of the last lease.
+    g_slab = static_cast<uint8_t*>(malloc(SLAB_SIZE));
+    if (g_slab) {
+      g_slabBusy.store(false);
+      g_slabHits = 0;
+      g_slabMisses = 0;
+      g_slabMaxMiss = 0;
+      g_slabMaxOver = 0;
+      wolfSSL_SetAllocators(slabMalloc, slabFree, slabRealloc);
+    }
+  }
+  if (g_slab) {
+    g_slabLeases.fetch_add(1);
+    _owned = true;
+  }
+}
+
+TlsRecordSlab::~TlsRecordSlab() {
+  if (!_owned) return;
+  if (g_slabLeases.fetch_sub(1) > 1) return;  // fetch_sub returns the value BEFORE the decrement
+  // Never pull the block out from under a live session. This cannot happen the way the
+  // downloader uses it (the lease outlives every SecureHttpClient it covers), but if a
+  // connection ever did outlive its lease, keeping the block and the allocators costs
+  // SLAB_SIZE until the next lease reuses and then releases it — dropping them would
+  // corrupt the session instead.
+  if (g_slabBusy.load()) return;
+  wolfSSL_SetAllocators(nullptr, nullptr, nullptr);
+  free(g_slab);
+  g_slab = nullptr;
+}
+
+size_t TlsRecordSlab::size() { return SLAB_SIZE; }
+uint32_t TlsRecordSlab::hits() { return g_slabHits; }
+uint32_t TlsRecordSlab::misses() { return g_slabMisses; }
+uint32_t TlsRecordSlab::largestMiss() { return g_slabMaxMiss > g_slabMaxOver ? g_slabMaxMiss : g_slabMaxOver; }
+
 #else  // !FREEINK_NET_WOLFSSL — inert stub so the SDK builds without wolfSSL.
+
+TlsRecordSlab::TlsRecordSlab() = default;
+TlsRecordSlab::~TlsRecordSlab() = default;
+size_t TlsRecordSlab::size() { return 0; }
+uint32_t TlsRecordSlab::hits() { return 0; }
+uint32_t TlsRecordSlab::misses() { return 0; }
+uint32_t TlsRecordSlab::largestMiss() { return 0; }
 
 int SecureClient::connect(const char* host, uint16_t port) {
   (void)host; (void)port;

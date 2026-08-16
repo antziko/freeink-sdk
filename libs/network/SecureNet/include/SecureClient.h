@@ -51,6 +51,14 @@ class SecureClient : public Client {
   // True if the library was built with wolfSSL TLS 1.3 support enabled.
   static bool tls13Available();
 
+  // wolfSSL_get_error() code from the read that ended the session, or 0 while healthy.
+  // A mid-stream death is otherwise indistinguishable from a clean peer close by the
+  // time it reaches a caller — both just stop the body — and this is the number that
+  // tells them apart (MEMORY_E is -125, i.e. the receive buffer for an incoming record
+  // could not be allocated). It was already being captured and printed to Serial, which
+  // on a serial-less device meant the one diagnostic that matters was never visible.
+  int lastReadError() const { return _lastReadErr; }
+
  private:
   int connectWithMethod(const char* host, uint16_t port, void* method, const char* label);
 
@@ -60,6 +68,49 @@ class SecureClient : public Client {
   void* _ssl = nullptr;  // WOLFSSL* (opaque to keep wolfSSL headers out of here)
   void* _ctx = nullptr;  // WOLFSSL_CTX*
   bool _connected = false;
+  int _lastReadErr = 0;  // see lastReadError()
+};
+
+// Reusable backing block for wolfSSL's per-record receive buffer.
+//
+// WHY: wolfSSL frees its dynamic input buffer after every record it hands to the
+// application (ReceiveData -> ShrinkInputBuffer, internal.c:24858) and allocates a
+// fresh one for the next record (GrowInputBuffer -> XMALLOC(size + usedLength + align),
+// internal.c:10784). With the 16384-byte records a default nginx sends, that is one
+// ~16.4KB CONTIGUOUS allocation per record -- roughly 105 of them across a 1.7MB
+// download. Post-WiFi the X3 has ~43KB free with a ~20KB largest block, so each one is
+// a lottery against the transfer's own allocation churn, and device captures show it
+// losing after ~200KB on every HTTPS attempt (MEMORY_E, -125). The identical file over
+// plain HTTP, through the same sink and the same activity, completes at 1.7MB with zero
+// retries -- the difference is entirely this buffer.
+//
+// Buying one block up front and serving those requests out of it turns the free/alloc
+// cycle into a flag toggle, so after the first success it cannot fail again. Requests
+// outside the record-size band go straight to malloc, so nothing else is affected.
+//
+// Scoped by RAII: while no lease is held the block does not exist and wolfSSL allocates
+// exactly as it does today, which keeps connections that never stream a large body
+// (KOSync, OPDS feed fetches) on the unchanged path.
+class TlsRecordSlab {
+ public:
+  TlsRecordSlab();   // buys the block (and installs the allocators) on the first lease
+  ~TlsRecordSlab();  // releases both when the last lease goes away
+  TlsRecordSlab(const TlsRecordSlab&) = delete;
+  TlsRecordSlab& operator=(const TlsRecordSlab&) = delete;
+
+  // False when the block could not be bought: every allocation then behaves as before.
+  bool active() const { return _owned; }
+
+  static size_t size();      // bytes in the block
+  static uint32_t hits();    // record-band requests served from the block
+  static uint32_t misses();  // record-band requests that fell through to malloc
+  // Largest request the block could not serve, whether because it was already taken or
+  // because it exceeded size(). Non-zero alongside a MEMORY_E is what says the block is
+  // mis-sized rather than mis-aimed.
+  static uint32_t largestMiss();
+
+ private:
+  bool _owned = false;
 };
 
 }  // namespace freeink
