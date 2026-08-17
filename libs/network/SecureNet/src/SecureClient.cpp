@@ -128,6 +128,8 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   _lastReadErr = 0;  // per-connection: never report a previous session's death
   _resumed = false;
   _usedStored = false;
+  _tcpMs = 0;
+  _tlsMs = 0;
 #if defined(FREEINK_WOLFSSL_DEBUG)
   // Routes wolfSSL's internal trace through wolfSSL_Arduino_Serial_Print (the
   // application provides that hook). Shows exactly where a handshake stalls.
@@ -141,10 +143,12 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   stop();
   const uint32_t timeoutMs = getTimeout();
   _transport.setConnectionTimeout(timeoutMs);
+  const uint32_t tcpStart = millis();
   if (!_transport.connect(host, port)) {
     if (Serial) Serial.printf("[SecureClient] TCP connect failed (%s): %s:%u\n", label, host, port);
     return 0;
   }
+  _tcpMs = millis() - tcpStart;  // includes DNS: WiFiClient::connect resolves the name
 
   auto* ctx = wolfSSL_CTX_new(static_cast<WOLFSSL_METHOD*>(method));
   if (!ctx) {
@@ -199,7 +203,8 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   // The recv callback is non-blocking (returns WANT_READ when no bytes are
   // buffered), so wolfSSL_connect must be retried across handshake round-trips
   // rather than called once.
-  const uint32_t deadline = millis() + timeoutMs;
+  const uint32_t tlsStart = millis();
+  const uint32_t deadline = tlsStart + timeoutMs;
   int ret;
   while ((ret = wolfSSL_connect(ssl)) != WOLFSSL_SUCCESS) {
     const int err = wolfSSL_get_error(ssl, ret);
@@ -219,6 +224,7 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
     delay(5);
   }
   _connected = true;
+  _tlsMs = millis() - tlsStart;
   _resumed = wolfSSL_session_reused(ssl) == 1;
   // Record the key only now: stop() files the session under _host, and a handshake that
   // never completed must not overwrite the slot belonging to a host that did. A name too

@@ -312,6 +312,10 @@ class SecureHttpClient {
   // True when the last https hop resumed a cached TLS session rather than running a full
   // handshake. Always false on a plain-HTTP hop. See SecureClient::sessionResumed().
   bool tlsSessionResumed() const { return _secure.sessionResumed(); }
+  // Phase split of the last https connect; both 0 on a plain-HTTP hop, where the caller's
+  // end-to-end figure is all TCP + server think time. See SecureClient::tcpConnectMs().
+  uint32_t tcpConnectMs() const { return _secure.tcpConnectMs(); }
+  uint32_t tlsHandshakeMs() const { return _secure.tlsHandshakeMs(); }
   bool callbackAborted() const { return _callbackAborted; }
   bool aborted() const { return _aborted; }
   bool hasContentLength() const { return _haveContentLength; }

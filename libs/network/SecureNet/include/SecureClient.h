@@ -63,6 +63,14 @@ class SecureClient : public Client {
   // This is the only way to tell the two apart from a log: both end in "handshake ok".
   bool sessionResumed() const { return _resumed; }
 
+  // Phase split of the last connect(), so a caller's end-to-end "time to first byte"
+  // number can be attributed. Session tickets cut the TLS leg to ~90ms, at which point
+  // the leg that dominates a resumed download's per-hop cost is NOT this class's --
+  // without the split there is no way to tell client-side setup from server think time.
+  // tcpConnectMs covers DNS + the TCP SYN exchange (both live inside WiFiClient::connect).
+  uint32_t tcpConnectMs() const { return _tcpMs; }
+  uint32_t tlsHandshakeMs() const { return _tlsMs; }
+
  private:
   int connectWithMethod(const char* host, uint16_t port, void* method, const char* label);
   // Hand the finished session to the one-slot cache (called from stop(), before the
@@ -84,8 +92,10 @@ class SecureClient : public Client {
   // fit is never cached: a truncated key could alias two hosts onto one session.
   char _host[64] = {0};
   uint16_t _port = 0;
-  bool _resumed = false;      // see sessionResumed()
-  bool _usedStored = false;   // this connect restored a cached session
+  bool _resumed = false;     // see sessionResumed()
+  bool _usedStored = false;  // this connect restored a cached session
+  uint32_t _tcpMs = 0;       // see tcpConnectMs()
+  uint32_t _tlsMs = 0;       // see tlsHandshakeMs()
 };
 
 // Reusable backing block for wolfSSL's per-record receive buffer.
