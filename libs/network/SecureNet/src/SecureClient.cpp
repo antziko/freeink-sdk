@@ -323,19 +323,37 @@ uint8_t SecureClient::connected() { return _connected && _transport.connected();
 
 namespace {
 // GetInputData() calls GrowInputBuffer(ssl, curSize, usedLength), which asks for
-// curSize + usedLength + align: MAX_RECORD_SIZE is 16384 (internal.h:2292), align is at
-// most 16 (settings.h:2320), and usedLength at the growing call is the few header bytes
-// left over from the previous read, so 1KB of headroom covers it.
+// curSize + usedLength + align: align is at most 16 (settings.h:2320) and usedLength at
+// the growing call is the few header bytes left over from the previous read.
 //
-// The exact figure is 17408 because that is measured, not guessed: the reservation this
-// replaces asked for 17408 bytes at this same point in 38 consecutive device transfers
-// and got it every time. Going bigger for extra headroom would trade a certainty for a
-// maybe — if the block cannot be bought the whole mechanism is inactive.
-constexpr size_t SLAB_SIZE = 16384 + 1024;
-// Only divert requests big enough to be a record buffer. Handing the block to a 2KB
-// caller would strand it for the rest of the transfer, which is the failure this is
-// meant to prevent.
-constexpr size_t SLAB_MIN_REQUEST = 8192;
+// 5120, not 17408. The old figure assumed the peer sends MAX_RECORD_SIZE (16384) records.
+// It does not, and that assumption made this whole mechanism inert: 17408 was never once
+// buyable on a device, so every capture shows active=0 / slabHit=0.
+//
+// What the peer actually sends, measured through a TCP relay that frames the CLEARTEXT
+// TLS record headers (scripts/tls_record_probe.py) against the real origin over HTTP/1.1:
+//
+//     bytes into connection      record size
+//     0        ..  59,957        1,386
+//     59,957   .. 230,583        4,246
+//     230,583  ..                16,401
+//
+// It is a ramp, not a constant, and it restarts on every new connection. So the wall a
+// hop actually dies on is 4,246 -- and 37 x 1,386 = 51,282 against the smallest hop ever
+// observed on X3, 51,731. That is the failure: the hop clears the 1,386 phase and cannot
+// allocate for the step to 4,246.
+//
+// 5120 covers 4,246 + header + align with room. Sizing between here and 16401 buys almost
+// nothing: past 230,583 the ramp jumps straight to the TLS maximum, so an 11KB block would
+// clear a handful of 8-10KB transition records and then die anyway. And 16401 needs the
+// 17408 block that two boards have now proven cannot be bought. The ceiling this creates
+// is therefore ~230KB per hop, by design and not by accident.
+constexpr size_t SLAB_SIZE = 5120;
+// Only divert requests big enough to be a record buffer. Handing the block to a small
+// caller would strand it for the rest of the transfer, which is the failure this is meant
+// to prevent. 4096 sits below the 4,246-byte requests that matter and above the 1,386-byte
+// phase, which already succeeds through plain malloc and must keep doing so.
+constexpr size_t SLAB_MIN_REQUEST = 4096;
 
 uint8_t* g_slab = nullptr;
 std::atomic<bool> g_slabBusy{false};

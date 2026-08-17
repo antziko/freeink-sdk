@@ -103,13 +103,17 @@ class SecureClient : public Client {
 // WHY: wolfSSL frees its dynamic input buffer after every record it hands to the
 // application (ReceiveData -> ShrinkInputBuffer, internal.c:24858) and allocates a
 // fresh one for the next record (GrowInputBuffer -> XMALLOC(size + usedLength + align),
-// internal.c:10784). With the 16384-byte records a default nginx sends, that is one
-// ~16.4KB CONTIGUOUS allocation per record -- roughly 105 of them across a 1.7MB
-// download. Post-WiFi the X3 has ~43KB free with a ~20KB largest block, so each one is
-// a lottery against the transfer's own allocation churn, and device captures show it
-// losing after ~200KB on every HTTPS attempt (MEMORY_E, -125). The identical file over
-// plain HTTP, through the same sink and the same activity, completes at 1.7MB with zero
-// retries -- the difference is entirely this buffer.
+// internal.c:10784). So every incoming record needs one CONTIGUOUS allocation of its own
+// size, and mid-transfer an X3 has only ~2.2KB of contiguous heap to offer.
+//
+// The peer does not send one record size: it ramps, and it restarts the ramp on every new
+// connection. Measured against the real origin with scripts/tls_record_probe.py over
+// HTTP/1.1 -- 1,386 bytes for the first ~60KB, 4,246 to ~230KB, then 16,401. A hop
+// therefore clears the first phase and dies on the step to 4,246, which is why the
+// smallest hop ever captured is 51,731 bytes against 37 x 1,386 = 51,282.
+//
+// This block is sized for that step, not for the 16KB ceiling. See SLAB_SIZE in the .cpp
+// for why nothing between 5KB and 16.4KB is worth buying.
 //
 // Buying one block up front and serving those requests out of it turns the free/alloc
 // cycle into a flag toggle, so after the first success it cannot fail again. Requests
