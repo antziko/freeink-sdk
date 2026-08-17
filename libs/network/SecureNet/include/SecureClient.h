@@ -59,8 +59,18 @@ class SecureClient : public Client {
   // on a serial-less device meant the one diagnostic that matters was never visible.
   int lastReadError() const { return _lastReadErr; }
 
+  // True when the last handshake resumed a cached session instead of running a full one.
+  // This is the only way to tell the two apart from a log: both end in "handshake ok".
+  bool sessionResumed() const { return _resumed; }
+
  private:
   int connectWithMethod(const char* host, uint16_t port, void* method, const char* label);
+  // Hand the finished session to the one-slot cache (called from stop(), before the
+  // WOLFSSL object is freed) / take it back for host:port. See the cache notes in the .cpp.
+  void saveSession();
+  bool restoreSession(const char* host, uint16_t port);
+  // stop(), plus eviction of the cached session when this handshake had restored one.
+  void failHandshake();
 
   WiFiClient _transport;
   const char* _rootCA = nullptr;
@@ -69,6 +79,13 @@ class SecureClient : public Client {
   void* _ctx = nullptr;  // WOLFSSL_CTX*
   bool _connected = false;
   int _lastReadErr = 0;  // see lastReadError()
+  // Host of the session currently owned by _ssl, recorded only once the handshake
+  // succeeds so that stop() files the session under the right key. A name that does not
+  // fit is never cached: a truncated key could alias two hosts onto one session.
+  char _host[64] = {0};
+  uint16_t _port = 0;
+  bool _resumed = false;      // see sessionResumed()
+  bool _usedStored = false;   // this connect restored a cached session
 };
 
 // Reusable backing block for wolfSSL's per-record receive buffer.

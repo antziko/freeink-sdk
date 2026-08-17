@@ -51,6 +51,32 @@ int wcRecv(WOLFSSL* /*ssl*/, char* buf, int sz, void* ctx) {
   return n;
 }
 
+// --- one-slot session cache (see saveSession/restoreSession) ---
+//
+// WHY file-static rather than a member: HttpDownloader constructs a fresh
+// SecureHttpClient (and so a fresh SecureClient) inside its resume-hop loop, so a
+// per-object cache would be destroyed between every hop -- exactly the hops that need
+// it. One slot is enough because the device talks to one host at a time; a second host
+// simply evicts the first and pays a full handshake, which is today's behaviour.
+//
+// Ownership: wolfSSL_get1_session() bumps the refcount because ssl->session is created
+// by wolfSSL_NewSession(), which stamps it WOLFSSL_SESSION_TYPE_HEAP (internal.c:7594,
+// ssl_sess.c:3671) -- so the object outlives wolfSSL_free() and is released here with
+// wolfSSL_SESSION_free(). Not a WOLFSSL_CTX-owned pointer, so freeing the CTX in stop()
+// does not touch it.
+WOLFSSL_SESSION* g_session = nullptr;
+char g_sessionHost[64] = {0};
+uint16_t g_sessionPort = 0;
+
+void dropSession() {
+  if (g_session) {
+    wolfSSL_SESSION_free(g_session);
+    g_session = nullptr;
+  }
+  g_sessionHost[0] = '\0';
+  g_sessionPort = 0;
+}
+
 bool isWantIo(const int err) {
   // Only the wolfSSL_get_error() codes. The WOLFSSL_CBIO_ERR_* callback return
   // codes never come out of wolfSSL_get_error and collide with fatal wolfCrypt
@@ -60,8 +86,48 @@ bool isWantIo(const int err) {
 }
 }  // namespace
 
+void SecureClient::saveSession() {
+  // Called from stop(), i.e. after every read on this session has been made -- which is
+  // the only correct moment, because a TLS 1.3 NewSessionTicket is post-handshake
+  // application-layer data and lands in ssl->session during wolfSSL_read, not during
+  // wolfSSL_connect. Snapshotting at handshake time would cache a ticketless session.
+  if (!_ssl || _host[0] == '\0') return;
+  auto* fresh = wolfSSL_get1_session(static_cast<WOLFSSL*>(_ssl));
+  if (!fresh) return;
+  if (!wolfSSL_SessionIsSetup(fresh)) {
+    // A failed or half-built handshake: drop the reference get1 just took and keep
+    // whatever was already cached.
+    wolfSSL_SESSION_free(fresh);
+    return;
+  }
+  // Take over the reference get1_session added, THEN release the previous slot holder.
+  // Order matters when they are the same object (wolfSSL_set_session points ssl->session
+  // straight at ours and up-refs it): releasing first would work on a count of 2, but
+  // doing it in this order means the pointer is never momentarily unowned.
+  WOLFSSL_SESSION* prev = g_session;
+  g_session = fresh;
+  strncpy(g_sessionHost, _host, sizeof(g_sessionHost) - 1);
+  g_sessionHost[sizeof(g_sessionHost) - 1] = '\0';
+  g_sessionPort = _port;
+  if (prev) wolfSSL_SESSION_free(prev);
+}
+
+bool SecureClient::restoreSession(const char* host, uint16_t port) {
+  if (!g_session || !_ssl) return false;
+  if (port != g_sessionPort || strcmp(host, g_sessionHost) != 0) return false;
+  if (wolfSSL_set_session(static_cast<WOLFSSL*>(_ssl), g_session) != WOLFSSL_SUCCESS) {
+    // Expired, wrong role, or the cache rejected it. Not an error -- fall through to a
+    // full handshake -- but the slot is useless now, so give the memory back.
+    dropSession();
+    return false;
+  }
+  return true;
+}
+
 int SecureClient::connectWithMethod(const char* host, uint16_t port, void* method, const char* label) {
   _lastReadErr = 0;  // per-connection: never report a previous session's death
+  _resumed = false;
+  _usedStored = false;
 #if defined(FREEINK_WOLFSSL_DEBUG)
   // Routes wolfSSL's internal trace through wolfSSL_Arduino_Serial_Print (the
   // application provides that hook). Shows exactly where a handshake stalls.
@@ -126,6 +192,9 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   // ignore the extension keep 16KB records and behave as before.
   wolfSSL_UseMaxFragment(ssl, WOLFSSL_MFL_2_11);
 #endif
+  // Must precede wolfSSL_connect: set_session is what puts the cached ticket in the
+  // ClientHello's pre_shared_key extension.
+  _usedStored = restoreSession(host, port);
 
   // The recv callback is non-blocking (returns WANT_READ when no bytes are
   // buffered), so wolfSSL_connect must be retried across handshake round-trips
@@ -136,7 +205,7 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
     const int err = wolfSSL_get_error(ssl, ret);
     if (!isWantIo(err)) {
       if (Serial) Serial.printf("[SecureClient] wolfSSL_connect failed (%s): %d\n", label, err);
-      stop();
+      failHandshake();
       return 0;
     }
     if (static_cast<int32_t>(millis() - deadline) >= 0) {
@@ -144,17 +213,40 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
         Serial.printf("[SecureClient] handshake timeout (%s): last err %d, transport %s, free heap %u\n", label, err,
                       _transport.connected() ? "up" : "down", (unsigned)ESP.getFreeHeap());
       }
-      stop();
+      failHandshake();
       return 0;
     }
     delay(5);
   }
   _connected = true;
+  _resumed = wolfSSL_session_reused(ssl) == 1;
+  // Record the key only now: stop() files the session under _host, and a handshake that
+  // never completed must not overwrite the slot belonging to a host that did. A name too
+  // long for the buffer is left empty, which disables caching for this connection --
+  // truncating could alias two hosts onto one session.
+  if (strlen(host) < sizeof(_host)) {
+    strncpy(_host, host, sizeof(_host) - 1);
+    _host[sizeof(_host) - 1] = '\0';
+    _port = port;
+  } else {
+    _host[0] = '\0';
+  }
   if (Serial) {
-    Serial.printf("[SecureClient] handshake ok (%s): %s / %s in %lu ms\n", label, wolfSSL_get_version(ssl),
-                  wolfSSL_get_cipher(ssl), (unsigned long)(millis() - started));
+    Serial.printf("[SecureClient] handshake ok (%s): %s / %s in %lu ms%s\n", label, wolfSSL_get_version(ssl),
+                  wolfSSL_get_cipher(ssl), (unsigned long)(millis() - started), _resumed ? " (resumed)" : "");
   }
   return 1;
+}
+
+void SecureClient::failHandshake() {
+  // A handshake that died after we offered a cached session is the one case where the
+  // cache itself is suspect (expired ticket, server rotated its STEK, resumption
+  // rejected fatally). Throw it away so the immediate retry -- and the TLS 1.2 fallback
+  // in connect() -- runs clean. Fail-closed: the cost of being wrong is one full
+  // handshake, which is what every connection did before this existed.
+  const bool poisoned = _usedStored;
+  stop();
+  if (poisoned) dropSession();
 }
 
 int SecureClient::connect(const char* host, uint16_t port) {
@@ -212,6 +304,7 @@ int SecureClient::available() {
 }
 
 void SecureClient::stop() {
+  saveSession();  // must precede wolfSSL_free: it reads ssl->session
   if (_ssl) { wolfSSL_free(static_cast<WOLFSSL*>(_ssl)); _ssl = nullptr; }
   if (_ctx) { wolfSSL_CTX_free(static_cast<WOLFSSL_CTX*>(_ctx)); _ctx = nullptr; }
   _transport.stop();
@@ -356,6 +449,9 @@ int SecureClient::read(uint8_t* buf, size_t size) { (void)buf; (void)size; retur
 int SecureClient::available() { return 0; }
 void SecureClient::stop() { _transport.stop(); _connected = false; }
 uint8_t SecureClient::connected() { return 0; }
+void SecureClient::saveSession() {}
+bool SecureClient::restoreSession(const char* host, uint16_t port) { (void)host; (void)port; return false; }
+void SecureClient::failHandshake() { stop(); }
 
 #endif
 

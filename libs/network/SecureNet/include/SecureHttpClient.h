@@ -309,6 +309,9 @@ class SecureHttpClient {
   // Pair it with !responseComplete() to say WHY a body stopped early — see
   // SecureClient::lastReadError().
   int lastTlsError() const { return _secure.lastReadError(); }
+  // True when the last https hop resumed a cached TLS session rather than running a full
+  // handshake. Always false on a plain-HTTP hop. See SecureClient::sessionResumed().
+  bool tlsSessionResumed() const { return _secure.sessionResumed(); }
   bool callbackAborted() const { return _callbackAborted; }
   bool aborted() const { return _aborted; }
   bool hasContentLength() const { return _haveContentLength; }
