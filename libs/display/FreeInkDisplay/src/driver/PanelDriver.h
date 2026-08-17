@@ -101,6 +101,10 @@ class PanelDriver {
 
   // --- grayscale (dual-plane LSB/MSB) ---
   virtual bool supportsStripGrayscale() const { return false; }
+  // True when this controller accepts SSD1677 absolute selector planes with
+  // the factory-quality LUT. This is a runtime capability because one firmware
+  // image may include several drivers and select the controller during boot.
+  virtual bool supportsFactoryGrayscale() const { return false; }
   // True when displayGrayscaleBase() DEFERS the base activation so the gray
   // planes join it in a single waveform (Paper Mono). Hosts should then route the
   // grayscale base through displayGrayscaleBase() instead of display(): a

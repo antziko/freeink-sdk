@@ -14,6 +14,8 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 
+#include <cstdint>
+
 class InputManager {
  public:
   InputManager();
@@ -81,8 +83,32 @@ class InputManager {
     unsigned long timestamp;
   };
 
+  // Fixed-size contact snapshot for allocation-free multi-touch polling. `id`
+  // is the GT911 track ID when `idsStable` is true. Coordinate-only GT911
+  // frames expose frame-local record slots instead, so callers must not retain
+  // those IDs across frames. `count` is capped at MAX_TOUCH_CONTACTS;
+  // `reportedCount` keeps the controller's actual count so callers can detect
+  // truncation and opt into only the contact counts they support.
+  static constexpr uint8_t MAX_TOUCH_CONTACTS = 4;
+  struct MultiTouchPoint {
+    uint8_t id;
+    TouchPoint point;
+  };
+  struct TouchSnapshot {
+    uint8_t count;
+    uint8_t reportedCount;
+    bool idsStable;
+    MultiTouchPoint points[MAX_TOUCH_CONTACTS];
+  };
+
   // True if this board has a touch controller configured.
   bool hasTouch() const;
+  // True only while a GT911 controller is present. Other touch controllers
+  // retain their existing single-contact contract.
+  bool supportsMultiTouch() const;
+  // Latest GT911 contacts, capped at MAX_TOUCH_CONTACTS. Gesture consumers
+  // should check reportedCount for the exact cardinality they support.
+  TouchSnapshot getTouchSnapshot() const;
   // The most recent touch sampled during #update(). valid == false when idle.
   TouchPoint getTouchPoint() const;
   // True while a touch is currently down.
@@ -112,6 +138,14 @@ class InputManager {
   // Swipe gesture on release. Returns start/end positions normalized in the
   // panel's native frame; callers map orientation and check this before tap.
   bool wasSwipe(float& nxStart, float& nyStart, float& nxEnd, float& nyEnd) const;
+  // One-shot 2-4 contact translation gesture. The SDK reports the number of
+  // contacts plus their centroid start/end normalized in its panel-native
+  // frame; applications opt into the exact counts they support, map display
+  // orientation, and decide whether the result is up/down/left/right. Pinches,
+  // rotations, diagonal motion, delayed gestures, ambiguous contact matching,
+  // track-ID replacements, and sequences above MAX_TOUCH_CONTACTS are rejected.
+  bool wasMultiTouchSwipe(uint8_t& contactCount, float& nxStart, float& nyStart, float& nxEnd, float& nyEnd,
+                          unsigned long& durationMs) const;
   // One-shot long-press: fires WHILE the finger is still down, once a
   // stationary contact (within tap slop) has been held TOUCH_LONG_PRESS_MS.
   // Position is the touch-down point, normalized like wasTouchTap. Fires at
@@ -122,7 +156,8 @@ class InputManager {
   // Ignore the remainder of the current contact: tap, swipe, release,
   // tap-candidate and held queries report nothing until the finger lifts and
   // the release edge has passed, then a fresh contact is delivered normally.
-  // Self-clears; the async tap/swipe queues are gated by the same latch.
+  // Self-clears; async tap, single-swipe, and multi-touch-swipe queues are
+  // gated by the same latch.
   void suppressTouchContact();
   // True if a touch press or release happened this frame. Coarse "the user
   // touched the screen" signal (the touch analogue of wasAnyPressed/Released)
@@ -183,6 +218,14 @@ class InputManager {
   // swipes so gestures that complete during e-paper refreshes are not lost.
   bool popSwipe(float& nxStart, float& nyStart, float& nxEnd, float& nyEnd);
 
+  // Pop a queued 2-4 contact translation, in the same normalized panel-native
+  // coordinate frame as wasMultiTouchSwipe(). It has a dedicated queue so
+  // existing popSwipe() consumers never receive multi-touch gestures. The
+  // returned count is captured with the queued event and cannot be confused
+  // with a later controller frame.
+  bool popMultiTouchSwipe(uint8_t& contactCount, float& nxStart, float& nyStart, float& nxEnd, float& nyEnd,
+                          unsigned long& durationMs);
+
   // --- Diagnostics -----------------------------------------------------------
   // A live sample of one button-group ADC pin: the raw reading plus the BTN_*
   // it currently classifies as (-1 = no band matched). On the Xteink ADC ladder
@@ -208,6 +251,15 @@ class InputManager {
   QueueHandle_t _asyncQueue = nullptr;
   QueueHandle_t _asyncTapQueue = nullptr;
   QueueHandle_t _asyncSwipeQueue = nullptr;
+  struct QueuedMultiTouchSwipe {
+    uint16_t startX;
+    uint16_t startY;
+    uint16_t endX;
+    uint16_t endY;
+    uint8_t contactCount;
+    uint16_t durationMs;
+  };
+  QueueHandle_t _asyncMultiTouchSwipeQueue = nullptr;
   TaskHandle_t _asyncTask = nullptr;
   uint32_t _asyncPollMs = 15;
   static void asyncTaskTrampoline(void* self);
@@ -240,6 +292,27 @@ class InputManager {
   void gt911ClearStatus();
   void beginFt6336u();
   void pollFt6336u(unsigned long now);
+
+  enum class MultiTouchGestureState : uint8_t { Idle, Tracking, Blocked };
+  struct TrackedTouchContact {
+    uint8_t id;
+    TouchPoint start;
+    TouchPoint last;
+  };
+  void updateMultiTouchGesture(const TouchSnapshot& snapshot, unsigned long now);
+  void startMultiTouchGesture(const TouchSnapshot& snapshot, unsigned long now);
+  void blockMultiTouchGesture();
+  void finishMultiTouchGesture(unsigned long now);
+  void resetMultiTouchGesture();
+  void cancelMultiTouchGesture();
+  bool matchMultiTouchSnapshot(const TouchSnapshot& snapshot);
+  bool expandMultiTouchGesture(const TouchSnapshot& snapshot, unsigned long now);
+  bool findContactAssignment(const TouchSnapshot& snapshot, uint8_t trackedCount,
+                             uint8_t assignment[MAX_TOUCH_CONTACTS]) const;
+  bool isTrackedContact(const MultiTouchPoint& point) const;
+  bool hasStableMultiTouchGeometry() const;
+  bool isMultiTouchTranslation(unsigned long now) const;
+  void normalizeTouchPoint(uint16_t x, uint16_t y, float& nx, float& ny) const;
 
   uint8_t currentState;
   uint8_t lastState;
@@ -277,6 +350,18 @@ class InputManager {
   unsigned long touchHomeKeyDownAt = 0;
   static constexpr unsigned long HOME_KEY_LONG_PRESS_MS = 700;
   TouchPoint touchPoint = {false, 0, 0, 0};
+  TouchSnapshot touchSnapshot{};
+  MultiTouchGestureState multiTouchGestureState = MultiTouchGestureState::Idle;
+  TrackedTouchContact multiTouchContacts[MAX_TOUCH_CONTACTS] = {};
+  uint8_t trackedTouchContactCount = 0;
+  bool touchMultiContactSequence = false;  // suppresses single-contact classifiers until full release
+  bool multiTouchSwipeEvent = false;
+  uint8_t multiTouchSwipeContactCount = 0;
+  uint16_t multiTouchSwipeStartX = 0;
+  uint16_t multiTouchSwipeStartY = 0;
+  uint16_t multiTouchSwipeEndX = 0;
+  uint16_t multiTouchSwipeEndY = 0;
+  uint16_t multiTouchSwipeDurationMs = 0;
   TouchPoint touchDownPoint = {false, 0, 0, 0};  // first sample of the current contact (tap routing)
   TouchPoint touchUpPoint = {false, 0, 0, 0};    // last sample before release (swipe routing)
   unsigned long lastTouchHeldDurationMs = 0;     // contact duration, latched at release
@@ -308,6 +393,9 @@ class InputManager {
   static constexpr int TOUCH_SWIPE_MIN_PX = 60;
   static constexpr int TOUCH_TAP_RELEASE_SLOP_PX = TOUCH_SWIPE_MIN_PX - 1;
   static constexpr unsigned long TOUCH_SWIPE_MAX_MS = 700;
+  static constexpr unsigned long TOUCH_MULTI_SWIPE_MAX_MS = 2000;
+  static constexpr int TOUCH_MULTI_CONTACT_SEPARATION_SLOP_PX = 45;
+  static constexpr int64_t TOUCH_CONTACT_ASSIGNMENT_AMBIGUITY_PX_SQ = 64;
   static constexpr unsigned long TOUCH_LONG_PRESS_MS = 500;  // shorter than HOME_KEY_LONG_PRESS_MS: a screen hold has
                                                              // no button travel to absorb
   static constexpr uint8_t TOUCH_READ_COMMAND = 0x00;

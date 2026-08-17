@@ -100,6 +100,9 @@ class FreeInkDisplay {
   bool supportsBusyGrayscaleStaging() const;
   void prepareGrayscaleTarget();
   bool supportsStripGrayscale() const;
+  // True only when the runtime-selected panel driver accepts SSD1677 factory
+  // LUT plane encoding.
+  bool supportsFactoryGrayscale() const;
   // True when displayGrayscaleBase() defers the base activation so the gray
   // planes join it in one waveform (Paper Mono) - see PanelDriver.
   bool combinesGrayscaleBase() const;

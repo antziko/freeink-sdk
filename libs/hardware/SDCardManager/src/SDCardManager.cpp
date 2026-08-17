@@ -317,11 +317,6 @@ bool SDCardManager::ensureDirectoryExists(const char* path) {
 }
 
 bool SDCardManager::openFileForRead(const char* moduleName, const char* path, FsFile& file) {
-  if (!vol().exists(path)) {
-    if (Serial) Serial.printf("[%lu] [%s] File does not exist: %s\n", millis(), moduleName, path);
-    return false;
-  }
-
   file = vol().open(path, O_RDONLY);
   if (!file) {
     if (Serial) Serial.printf("[%lu] [%s] Failed to open file for reading: %s\n", millis(), moduleName, path);

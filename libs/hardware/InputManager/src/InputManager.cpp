@@ -1,5 +1,7 @@
 #include "InputManager.h"
 
+#include <algorithm>
+
 #if FREEINK_CAP_TOUCH
 #include <Wire.h>
 #include <driver/gpio.h>
@@ -173,6 +175,7 @@ void InputManager::beginAsync(const uint8_t taskPriority, const uint32_t pollMs,
   if (!_asyncQueue) return;
   _asyncTapQueue = xQueueCreate(queueLen, sizeof(float) * 2);
   _asyncSwipeQueue = xQueueCreate(queueLen, sizeof(float) * 4);
+  _asyncMultiTouchSwipeQueue = xQueueCreate(queueLen, sizeof(QueuedMultiTouchSwipe));
   xTaskCreate(asyncTaskTrampoline, "fi_input", 4096, this, taskPriority, &_asyncTask);
 }
 
@@ -192,6 +195,12 @@ void InputManager::asyncPoll() {
     float swipe[4];
     if (_asyncSwipeQueue && wasSwipe(swipe[0], swipe[1], swipe[2], swipe[3])) {
       xQueueSend(_asyncSwipeQueue, swipe, 0);
+    }
+    if (_asyncMultiTouchSwipeQueue && multiTouchSwipeEvent && !touchSuppressed) {
+      const QueuedMultiTouchSwipe multiTouchSwipe = {multiTouchSwipeStartX,       multiTouchSwipeStartY,
+                                                     multiTouchSwipeEndX,         multiTouchSwipeEndY,
+                                                     multiTouchSwipeContactCount, multiTouchSwipeDurationMs};
+      xQueueSend(_asyncMultiTouchSwipeQueue, &multiTouchSwipe, 0);
     }
     vTaskDelay(pdMS_TO_TICKS(_asyncPollMs));
   }
@@ -219,6 +228,18 @@ bool InputManager::popSwipe(float& nxStart, float& nyStart, float& nxEnd, float&
   nyStart = swipe[1];
   nxEnd = swipe[2];
   nyEnd = swipe[3];
+  return true;
+}
+
+bool InputManager::popMultiTouchSwipe(uint8_t& contactCount, float& nxStart, float& nyStart, float& nxEnd, float& nyEnd,
+                                      unsigned long& durationMs) {
+  if (!_asyncMultiTouchSwipeQueue) return false;
+  QueuedMultiTouchSwipe swipe{};
+  if (xQueueReceive(_asyncMultiTouchSwipeQueue, &swipe, 0) != pdTRUE) return false;
+  contactCount = swipe.contactCount;
+  normalizeTouchPoint(swipe.startX, swipe.startY, nxStart, nyStart);
+  normalizeTouchPoint(swipe.endX, swipe.endY, nxEnd, nyEnd);
+  durationMs = swipe.durationMs;
   return true;
 }
 
@@ -415,6 +436,7 @@ void InputManager::update() {
   touchPressedEvent = false;  // one-shot touch coord events, cleared each update()
   touchReleasedEvent = false;
   touchLongPressEvent = false;
+  multiTouchSwipeEvent = false;
   touchHomeKeyEvent = false;
   touchHomeKeyTapEvent = false;
   touchHomeKeyLongEvent = false;
@@ -506,13 +528,44 @@ bool InputManager::hasTouch() const {
 }
 
 InputManager::TouchPoint InputManager::getTouchPoint() const { return touchPoint; }
+
+bool InputManager::supportsMultiTouch() const {
+#if FREEINK_CAP_TOUCH
+  return touchDataEnabled && BoardConfig::ACTIVE.touch.controller == BoardConfig::TouchController::Gt911;
+#else
+  return false;
+#endif
+}
+
+InputManager::TouchSnapshot InputManager::getTouchSnapshot() const {
+#if FREEINK_CAP_TOUCH
+  return touchSnapshot;
+#else
+  return {};
+#endif
+}
+
 bool InputManager::isTouchPressed() const { return touchPressed; }
-bool InputManager::wasTouchPressed() const { return touchPressedEvent; }
-bool InputManager::wasTouchReleased() const { return touchReleasedEvent && !touchSuppressed; }
+bool InputManager::wasTouchPressed() const { return touchPressedEvent && !touchMultiContactSequence; }
+bool InputManager::wasTouchReleased() const {
+  // A multi-touch gesture must still provide the raw release edge so UI code
+  // can drop pressed-state feedback, even though its tap/drag classifiers are
+  // suppressed below.
+  return touchReleasedEvent && (!touchSuppressed || touchMultiContactSequence);
+}
+
+void InputManager::normalizeTouchPoint(const uint16_t x, const uint16_t y, float& nx, float& ny) const {
+  const auto& t = BoardConfig::ACTIVE.touch;
+  const uint16_t w = (t.rawMaxX > t.rawMinX) ? static_cast<uint16_t>(t.rawMaxX - t.rawMinX) : 1;
+  const uint16_t h = (t.rawMaxY > t.rawMinY) ? static_cast<uint16_t>(t.rawMaxY - t.rawMinY) : 1;
+  const auto clamp01 = [](const float value) { return value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value); };
+  nx = clamp01(static_cast<float>(x) / w);
+  ny = clamp01(static_cast<float>(y) / h);
+}
 
 bool InputManager::wasTouchTap(float& nx, float& ny) const {
 #if FREEINK_CAP_TOUCH
-  if (!touchReleasedEvent || touchSuppressed) return false;
+  if (!touchReleasedEvent || touchSuppressed || touchMultiContactSequence) return false;
   // Hold/long-press detection uses the tighter 28 px stationary slop, but a
   // released tap remains valid until motion reaches the 60 px swipe threshold.
   // Using the stationary threshold here created a 29..59 px dead band where a
@@ -522,13 +575,7 @@ bool InputManager::wasTouchTap(float& nx, float& ny) const {
   // reported centroid drifts 10-20px as a finger rolls off during lift, which
   // made small targets (steppers) feel unreliable with release-point routing.
   // A tap routes to where the user touched, not where the finger let go.
-  const auto& t = BoardConfig::ACTIVE.touch;
-  const uint16_t w = (t.rawMaxX > t.rawMinX) ? static_cast<uint16_t>(t.rawMaxX - t.rawMinX) : 1;
-  const uint16_t h = (t.rawMaxY > t.rawMinY) ? static_cast<uint16_t>(t.rawMaxY - t.rawMinY) : 1;
-  float x = static_cast<float>(touchDownPoint.x) / w;
-  float y = static_cast<float>(touchDownPoint.y) / h;
-  nx = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
-  ny = y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
+  normalizeTouchPoint(touchDownPoint.x, touchDownPoint.y, nx, ny);
   return true;
 #else
   (void)nx;
@@ -543,14 +590,8 @@ bool InputManager::wasTouchPressedAt(float& nx, float& ny) const {
   // writing the touch-down position normalized 0..1 in the panel's native
   // frame. Lets the app highlight what's under the finger on touch-down (before
   // release).
-  if (!touchPressedEvent) return false;
-  const auto& t = BoardConfig::ACTIVE.touch;
-  const uint16_t w = (t.rawMaxX > t.rawMinX) ? static_cast<uint16_t>(t.rawMaxX - t.rawMinX) : 1;
-  const uint16_t h = (t.rawMaxY > t.rawMinY) ? static_cast<uint16_t>(t.rawMaxY - t.rawMinY) : 1;
-  float x = static_cast<float>(touchDownPoint.x) / w;
-  float y = static_cast<float>(touchDownPoint.y) / h;
-  nx = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
-  ny = y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
+  if (!touchPressedEvent || touchMultiContactSequence) return false;
+  normalizeTouchPoint(touchDownPoint.x, touchDownPoint.y, nx, ny);
   return true;
 #else
   (void)nx;
@@ -561,14 +602,8 @@ bool InputManager::wasTouchPressedAt(float& nx, float& ny) const {
 
 bool InputManager::isTouchTapCandidate(float& nx, float& ny, unsigned long& heldMs) const {
 #if FREEINK_CAP_TOUCH
-  if (!touchPressed || touchMovedBeyondTapSlop || touchSuppressed) return false;
-  const auto& t = BoardConfig::ACTIVE.touch;
-  const uint16_t w = (t.rawMaxX > t.rawMinX) ? static_cast<uint16_t>(t.rawMaxX - t.rawMinX) : 1;
-  const uint16_t h = (t.rawMaxY > t.rawMinY) ? static_cast<uint16_t>(t.rawMaxY - t.rawMinY) : 1;
-  float x = static_cast<float>(touchDownPoint.x) / w;
-  float y = static_cast<float>(touchDownPoint.y) / h;
-  nx = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
-  ny = y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
+  if (!touchPressed || touchMovedBeyondTapSlop || touchSuppressed || touchMultiContactSequence) return false;
+  normalizeTouchPoint(touchDownPoint.x, touchDownPoint.y, nx, ny);
   heldMs = millis() - touchDownPoint.timestamp;
   return true;
 #else
@@ -583,14 +618,8 @@ bool InputManager::isTouchHeldAt(float& nx, float& ny) const {
 #if FREEINK_CAP_TOUCH
   // Live drag tracking: the latest contact sample (touchUpPoint is refreshed on
   // every sample while pressed), with no tap-slop gate.
-  if (!touchPressed || touchSuppressed) return false;
-  const auto& t = BoardConfig::ACTIVE.touch;
-  const uint16_t w = (t.rawMaxX > t.rawMinX) ? static_cast<uint16_t>(t.rawMaxX - t.rawMinX) : 1;
-  const uint16_t h = (t.rawMaxY > t.rawMinY) ? static_cast<uint16_t>(t.rawMaxY - t.rawMinY) : 1;
-  float x = static_cast<float>(touchUpPoint.x) / w;
-  float y = static_cast<float>(touchUpPoint.y) / h;
-  nx = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
-  ny = y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
+  if (!touchPressed || touchSuppressed || touchMultiContactSequence) return false;
+  normalizeTouchPoint(touchUpPoint.x, touchUpPoint.y, nx, ny);
   return true;
 #else
   (void)nx;
@@ -617,7 +646,7 @@ bool InputManager::wasTouchActivity() const {
 
 bool InputManager::wasSwipe(float& nxStart, float& nyStart, float& nxEnd, float& nyEnd) const {
 #if FREEINK_CAP_TOUCH
-  if (!touchReleasedEvent || touchSuppressed) return false;
+  if (!touchReleasedEvent || touchSuppressed || touchMultiContactSequence) return false;
   // A flick: travelled past a distance threshold within a time window. Distance
   // is measured in native px; the dominant axis is left to the app (after
   // mapping to its logical frame).
@@ -627,14 +656,8 @@ bool InputManager::wasSwipe(float& nxStart, float& nyStart, float& nxEnd, float&
   const int adx = absInt(dx);
   const int ady = absInt(dy);
   if (adx < TOUCH_SWIPE_MIN_PX && ady < TOUCH_SWIPE_MIN_PX) return false;
-  const auto& t = BoardConfig::ACTIVE.touch;
-  const uint16_t w = (t.rawMaxX > t.rawMinX) ? static_cast<uint16_t>(t.rawMaxX - t.rawMinX) : 1;
-  const uint16_t h = (t.rawMaxY > t.rawMinY) ? static_cast<uint16_t>(t.rawMaxY - t.rawMinY) : 1;
-  auto clamp01 = [](float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
-  nxStart = clamp01(static_cast<float>(touchDownPoint.x) / w);
-  nyStart = clamp01(static_cast<float>(touchDownPoint.y) / h);
-  nxEnd = clamp01(static_cast<float>(touchUpPoint.x) / w);
-  nyEnd = clamp01(static_cast<float>(touchUpPoint.y) / h);
+  normalizeTouchPoint(touchDownPoint.x, touchDownPoint.y, nxStart, nyStart);
+  normalizeTouchPoint(touchUpPoint.x, touchUpPoint.y, nxEnd, nyEnd);
   return true;
 #else
   (void)nxStart;
@@ -645,17 +668,31 @@ bool InputManager::wasSwipe(float& nxStart, float& nyStart, float& nxEnd, float&
 #endif
 }
 
+bool InputManager::wasMultiTouchSwipe(uint8_t& contactCount, float& nxStart, float& nyStart, float& nxEnd, float& nyEnd,
+                                      unsigned long& durationMs) const {
+#if FREEINK_CAP_TOUCH
+  if (!multiTouchSwipeEvent || touchSuppressed) return false;
+  contactCount = multiTouchSwipeContactCount;
+  normalizeTouchPoint(multiTouchSwipeStartX, multiTouchSwipeStartY, nxStart, nyStart);
+  normalizeTouchPoint(multiTouchSwipeEndX, multiTouchSwipeEndY, nxEnd, nyEnd);
+  durationMs = multiTouchSwipeDurationMs;
+  return true;
+#else
+  (void)contactCount;
+  (void)nxStart;
+  (void)nyStart;
+  (void)nxEnd;
+  (void)nyEnd;
+  (void)durationMs;
+  return false;
+#endif
+}
+
 bool InputManager::wasTouchLongPress(float& nx, float& ny) const {
 #if FREEINK_CAP_TOUCH
-  if (!touchLongPressEvent) return false;
+  if (!touchLongPressEvent || touchMultiContactSequence) return false;
   // Long-press routes to the touch-down point, same rationale as wasTouchTap.
-  const auto& t = BoardConfig::ACTIVE.touch;
-  const uint16_t w = (t.rawMaxX > t.rawMinX) ? static_cast<uint16_t>(t.rawMaxX - t.rawMinX) : 1;
-  const uint16_t h = (t.rawMaxY > t.rawMinY) ? static_cast<uint16_t>(t.rawMaxY - t.rawMinY) : 1;
-  float x = static_cast<float>(touchDownPoint.x) / w;
-  float y = static_cast<float>(touchDownPoint.y) / h;
-  nx = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
-  ny = y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
+  normalizeTouchPoint(touchDownPoint.x, touchDownPoint.y, nx, ny);
   return true;
 #else
   (void)nx;
@@ -669,7 +706,301 @@ void InputManager::suppressTouchContact() {
   // Only meaningful mid-contact (or on its release-edge frame); the latch
   // self-clears in serviceTouch() once the contact is fully over.
   if (touchPressed || touchReleasedEvent) touchSuppressed = true;
+  cancelMultiTouchGesture();
+  if (_asyncMultiTouchSwipeQueue) xQueueReset(_asyncMultiTouchSwipeQueue);
 #endif
+}
+
+void InputManager::startMultiTouchGesture(const TouchSnapshot& snapshot, const unsigned long now) {
+  if (snapshot.count < 2 || snapshot.count > MAX_TOUCH_CONTACTS || snapshot.reportedCount != snapshot.count) {
+    blockMultiTouchGesture();
+    return;
+  }
+
+  if (snapshot.idsStable) {
+    for (uint8_t i = 0; i < snapshot.count; ++i) {
+      for (uint8_t j = i + 1; j < snapshot.count; ++j) {
+        if (snapshot.points[i].id == snapshot.points[j].id) {
+          blockMultiTouchGesture();
+          return;
+        }
+      }
+    }
+  }
+
+  trackedTouchContactCount = snapshot.count;
+  for (uint8_t i = 0; i < trackedTouchContactCount; ++i) {
+    multiTouchContacts[i] = {snapshot.points[i].id, snapshot.points[i].point, snapshot.points[i].point};
+    multiTouchContacts[i].start.timestamp = now;
+  }
+  for (uint8_t i = trackedTouchContactCount; i < MAX_TOUCH_CONTACTS; ++i) multiTouchContacts[i] = {};
+
+  multiTouchGestureState = MultiTouchGestureState::Tracking;
+  touchMultiContactSequence = true;
+  // Any multi-contact sequence invalidates every single-contact classifier.
+  touchMovedBeyondTapSlop = true;
+  touchMovedBeyondTapReleaseSlop = true;
+  touchLongPressEvent = false;
+  touchLongPressFired = true;
+}
+
+void InputManager::blockMultiTouchGesture() {
+  multiTouchGestureState = MultiTouchGestureState::Blocked;
+  touchMultiContactSequence = true;
+  touchMovedBeyondTapSlop = true;
+  touchMovedBeyondTapReleaseSlop = true;
+  touchLongPressEvent = false;
+  touchLongPressFired = true;
+}
+
+void InputManager::resetMultiTouchGesture() {
+  multiTouchGestureState = MultiTouchGestureState::Idle;
+  trackedTouchContactCount = 0;
+  touchMultiContactSequence = false;
+  for (auto& contact : multiTouchContacts) contact = {};
+}
+
+void InputManager::cancelMultiTouchGesture() {
+  multiTouchSwipeEvent = false;
+  multiTouchGestureState =
+      (touchPressed || touchReleasedEvent) ? MultiTouchGestureState::Blocked : MultiTouchGestureState::Idle;
+}
+
+bool InputManager::findContactAssignment(const TouchSnapshot& snapshot, const uint8_t trackedCount,
+                                         uint8_t assignment[MAX_TOUCH_CONTACTS]) const {
+  if (trackedCount == 0 || trackedCount > snapshot.count || snapshot.count > MAX_TOUCH_CONTACTS) return false;
+
+  if (snapshot.idsStable) {
+    uint8_t used = 0;
+    for (uint8_t tracked = 0; tracked < trackedCount; ++tracked) {
+      bool found = false;
+      for (uint8_t current = 0; current < snapshot.count; ++current) {
+        if ((used & (1u << current)) || snapshot.points[current].id != multiTouchContacts[tracked].id) continue;
+        assignment[tracked] = current;
+        used |= 1u << current;
+        found = true;
+        break;
+      }
+      if (!found) return false;
+    }
+    return true;
+  }
+
+  // Coordinate-only GT911 variants have no persistent contact identity. Find
+  // the unique lowest-movement injective assignment. With at most four points
+  // the exhaustive search is bounded at 4^4 candidates and allocates nothing.
+  const auto squaredDistance = [](const TouchPoint& a, const TouchPoint& b) {
+    const int64_t dx = static_cast<int64_t>(a.x) - static_cast<int64_t>(b.x);
+    const int64_t dy = static_cast<int64_t>(a.y) - static_cast<int64_t>(b.y);
+    return dx * dx + dy * dy;
+  };
+
+  uint16_t candidateCount = 1;
+  for (uint8_t i = 0; i < trackedCount; ++i) candidateCount *= snapshot.count;
+  int64_t bestDistance = INT64_MAX;
+  int64_t secondDistance = INT64_MAX;
+  uint8_t bestAssignment[MAX_TOUCH_CONTACTS] = {};
+  for (uint16_t code = 0; code < candidateCount; ++code) {
+    uint16_t remaining = code;
+    uint8_t used = 0;
+    uint8_t candidate[MAX_TOUCH_CONTACTS] = {};
+    int64_t distance = 0;
+    bool valid = true;
+    for (uint8_t tracked = 0; tracked < trackedCount; ++tracked) {
+      const uint8_t current = remaining % snapshot.count;
+      remaining /= snapshot.count;
+      if (used & (1u << current)) {
+        valid = false;
+        break;
+      }
+      used |= 1u << current;
+      candidate[tracked] = current;
+      distance += squaredDistance(multiTouchContacts[tracked].last, snapshot.points[current].point);
+    }
+    if (!valid) continue;
+    if (distance < bestDistance) {
+      secondDistance = bestDistance;
+      bestDistance = distance;
+      std::copy(candidate, candidate + trackedCount, bestAssignment);
+    } else if (distance < secondDistance) {
+      secondDistance = distance;
+    }
+  }
+
+  if (bestDistance == INT64_MAX) return false;
+  if (secondDistance != INT64_MAX && secondDistance - bestDistance <= TOUCH_CONTACT_ASSIGNMENT_AMBIGUITY_PX_SQ) {
+    return false;
+  }
+  std::copy(bestAssignment, bestAssignment + trackedCount, assignment);
+  return true;
+}
+
+bool InputManager::matchMultiTouchSnapshot(const TouchSnapshot& snapshot) {
+  if (snapshot.count != trackedTouchContactCount) return false;
+  uint8_t assignment[MAX_TOUCH_CONTACTS] = {};
+  if (!findContactAssignment(snapshot, trackedTouchContactCount, assignment)) return false;
+  for (uint8_t i = 0; i < trackedTouchContactCount; ++i) {
+    multiTouchContacts[i].last = snapshot.points[assignment[i]].point;
+  }
+  return true;
+}
+
+bool InputManager::expandMultiTouchGesture(const TouchSnapshot& snapshot, const unsigned long now) {
+  if (snapshot.count <= trackedTouchContactCount || snapshot.count > MAX_TOUCH_CONTACTS) return false;
+
+  uint8_t assignment[MAX_TOUCH_CONTACTS] = {};
+  if (!findContactAssignment(snapshot, trackedTouchContactCount, assignment)) return false;
+  for (uint8_t i = 0; i < trackedTouchContactCount; ++i) {
+    const TouchPoint& current = snapshot.points[assignment[i]].point;
+    if (absInt(static_cast<int>(current.x) - multiTouchContacts[i].start.x) > TOUCH_TAP_SLOP_PX ||
+        absInt(static_cast<int>(current.y) - multiTouchContacts[i].start.y) > TOUCH_TAP_SLOP_PX) {
+      return false;
+    }
+  }
+
+  // Fingers commonly land a few frames apart. While the existing contacts are
+  // still stationary, adopt the larger cardinality and start the translation
+  // from this coherent frame. A contact joining after motion begins is rejected.
+  startMultiTouchGesture(snapshot, now);
+  return multiTouchGestureState == MultiTouchGestureState::Tracking;
+}
+
+bool InputManager::isTrackedContact(const MultiTouchPoint& point) const {
+  for (uint8_t i = 0; i < trackedTouchContactCount; ++i) {
+    if (point.id == multiTouchContacts[i].id) return true;
+  }
+  return false;
+}
+
+bool InputManager::hasStableMultiTouchGeometry() const {
+  for (uint8_t first = 0; first < trackedTouchContactCount; ++first) {
+    for (uint8_t second = first + 1; second < trackedTouchContactCount; ++second) {
+      const int startSeparationX =
+          static_cast<int>(multiTouchContacts[second].start.x) - multiTouchContacts[first].start.x;
+      const int startSeparationY =
+          static_cast<int>(multiTouchContacts[second].start.y) - multiTouchContacts[first].start.y;
+      const int endSeparationX = static_cast<int>(multiTouchContacts[second].last.x) - multiTouchContacts[first].last.x;
+      const int endSeparationY = static_cast<int>(multiTouchContacts[second].last.y) - multiTouchContacts[first].last.y;
+      if (absInt(endSeparationX - startSeparationX) > TOUCH_MULTI_CONTACT_SEPARATION_SLOP_PX ||
+          absInt(endSeparationY - startSeparationY) > TOUCH_MULTI_CONTACT_SEPARATION_SLOP_PX) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool InputManager::isMultiTouchTranslation(const unsigned long now) const {
+  if (trackedTouchContactCount < 2 || now - multiTouchContacts[0].start.timestamp > TOUCH_MULTI_SWIPE_MAX_MS ||
+      !hasStableMultiTouchGeometry()) {
+    return false;
+  }
+
+  int startCenterX = 0;
+  int startCenterY = 0;
+  int endCenterX = 0;
+  int endCenterY = 0;
+  for (uint8_t i = 0; i < trackedTouchContactCount; ++i) {
+    startCenterX += multiTouchContacts[i].start.x;
+    startCenterY += multiTouchContacts[i].start.y;
+    endCenterX += multiTouchContacts[i].last.x;
+    endCenterY += multiTouchContacts[i].last.y;
+  }
+  startCenterX /= trackedTouchContactCount;
+  startCenterY /= trackedTouchContactCount;
+  endCenterX /= trackedTouchContactCount;
+  endCenterY /= trackedTouchContactCount;
+  const int centerDx = endCenterX - startCenterX;
+  const int centerDy = endCenterY - startCenterY;
+  const int centerAbsX = absInt(centerDx);
+  const int centerAbsY = absInt(centerDy);
+
+  if (centerAbsX >= TOUCH_SWIPE_MIN_PX && centerAbsX * 2 >= centerAbsY * 3) {
+    for (uint8_t i = 0; i < trackedTouchContactCount; ++i) {
+      const int dx = static_cast<int>(multiTouchContacts[i].last.x) - multiTouchContacts[i].start.x;
+      if (absInt(dx) < TOUCH_SWIPE_MIN_PX || (dx > 0) != (centerDx > 0)) return false;
+    }
+    return true;
+  }
+  if (centerAbsY >= TOUCH_SWIPE_MIN_PX && centerAbsY * 2 >= centerAbsX * 3) {
+    for (uint8_t i = 0; i < trackedTouchContactCount; ++i) {
+      const int dy = static_cast<int>(multiTouchContacts[i].last.y) - multiTouchContacts[i].start.y;
+      if (absInt(dy) < TOUCH_SWIPE_MIN_PX || (dy > 0) != (centerDy > 0)) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+void InputManager::finishMultiTouchGesture(const unsigned long now) {
+  if (isMultiTouchTranslation(now)) {
+    uint32_t startX = 0;
+    uint32_t startY = 0;
+    uint32_t endX = 0;
+    uint32_t endY = 0;
+    for (uint8_t i = 0; i < trackedTouchContactCount; ++i) {
+      startX += multiTouchContacts[i].start.x;
+      startY += multiTouchContacts[i].start.y;
+      endX += multiTouchContacts[i].last.x;
+      endY += multiTouchContacts[i].last.y;
+    }
+    multiTouchSwipeContactCount = trackedTouchContactCount;
+    multiTouchSwipeStartX = static_cast<uint16_t>(startX / trackedTouchContactCount);
+    multiTouchSwipeStartY = static_cast<uint16_t>(startY / trackedTouchContactCount);
+    multiTouchSwipeEndX = static_cast<uint16_t>(endX / trackedTouchContactCount);
+    multiTouchSwipeEndY = static_cast<uint16_t>(endY / trackedTouchContactCount);
+    multiTouchSwipeDurationMs = static_cast<uint16_t>(now - multiTouchContacts[0].start.timestamp);
+    multiTouchSwipeEvent = true;
+  }
+  multiTouchGestureState = MultiTouchGestureState::Blocked;
+}
+
+void InputManager::updateMultiTouchGesture(const TouchSnapshot& snapshot, const unsigned long now) {
+  if (snapshot.reportedCount > MAX_TOUCH_CONTACTS || snapshot.count != snapshot.reportedCount) {
+    blockMultiTouchGesture();
+    return;
+  }
+  if (snapshot.count == 0) {
+    if (multiTouchGestureState == MultiTouchGestureState::Tracking) finishMultiTouchGesture(now);
+    return;
+  }
+  if (multiTouchGestureState == MultiTouchGestureState::Blocked) return;
+  if (multiTouchGestureState == MultiTouchGestureState::Idle) {
+    if (snapshot.count < 2) return;
+    // A finger that has already dragged or long-pressed owns this contact;
+    // joining more fingers must not retroactively convert it into a swipe.
+    if (touchPressed && (touchMovedBeyondTapSlop || touchLongPressFired)) {
+      blockMultiTouchGesture();
+      return;
+    }
+    startMultiTouchGesture(snapshot, now);
+    return;
+  }
+  if (snapshot.count < trackedTouchContactCount) {
+    // Stable IDs let us reject a replacement contact arriving in the same
+    // frame that one of the original contacts leaves.
+    if (snapshot.idsStable) {
+      for (uint8_t i = 0; i < snapshot.count; ++i) {
+        if (!isTrackedContact(snapshot.points[i])) {
+          blockMultiTouchGesture();
+          return;
+        }
+        for (uint8_t j = i + 1; j < snapshot.count; ++j) {
+          if (snapshot.points[i].id == snapshot.points[j].id) {
+            blockMultiTouchGesture();
+            return;
+          }
+        }
+      }
+    }
+    finishMultiTouchGesture(now);  // first tracked contact left
+    return;
+  }
+  if (snapshot.count > trackedTouchContactCount) {
+    if (!expandMultiTouchGesture(snapshot, now)) blockMultiTouchGesture();
+    return;
+  }
+  if (!matchMultiTouchSnapshot(snapshot) || !hasStableMultiTouchGeometry()) blockMultiTouchGesture();
 }
 
 bool InputManager::wasHomeKeyPressed() const { return touchHomeKeyEvent; }
@@ -722,6 +1053,7 @@ uint8_t InputManager::serviceTouch() {
   if (!touchPressed && !touchReleasedEvent) {
     touchSuppressed = false;
     touchLongPressFired = false;
+    resetMultiTouchGesture();
   }
 
   if (t.controller == BoardConfig::TouchController::Gt911) {
@@ -738,8 +1070,8 @@ uint8_t InputManager::serviceTouch() {
 
   // Long-press classification, beside the tap/swipe machinery it shares state
   // with. Fires once per contact, while the finger is still down.
-  if (touchPressed && !touchMovedBeyondTapSlop && !touchLongPressFired && !touchSuppressed &&
-      now - touchDownPoint.timestamp >= TOUCH_LONG_PRESS_MS) {
+  if (touchPressed && !touchMultiContactSequence && !touchMovedBeyondTapSlop && !touchLongPressFired &&
+      !touchSuppressed && now - touchDownPoint.timestamp >= TOUCH_LONG_PRESS_MS) {
     touchLongPressFired = true;
     touchLongPressEvent = true;
   }
@@ -1373,6 +1705,11 @@ void InputManager::pollGt911(const unsigned long now) {
   }
   uint8_t status = 0;
   if (!gt911ReadReg(0x814E, &status, 1)) {
+    // Keep the last complete frame while the single-touch state remains
+    // latched. Clearing only this snapshot makes a transient I2C failure look
+    // like a multi-contact release to multi-touch consumers, which can split one
+    // physical gesture into two. A confirmed zero-contact frame below clears
+    // the snapshot together with the rest of the touch state.
     return;
   }
 
@@ -1404,27 +1741,46 @@ void InputManager::pollGt911(const unsigned long now) {
 
   const uint8_t count = status & 0x0F;
   if (count > 0) {
-    uint8_t pt[8] = {};
-    if (gt911ReadReg(0x8150, pt, 8)) {
-      // Coordinate bytes start at 0 (no track-id, e.g. M5Paper) or 1 (datasheet
-      // standard, e.g. LilyGo) depending on the board's GT911 config.
-      const uint8_t o = BoardConfig::ACTIVE.touch.gt911CoordsAtByte0 ? 0 : 1;
-      const uint16_t rawX = static_cast<uint16_t>(pt[o]) | (static_cast<uint16_t>(pt[o + 1]) << 8);
-      const uint16_t rawY = static_cast<uint16_t>(pt[o + 2]) | (static_cast<uint16_t>(pt[o + 3]) << 8);
+    // GT911 stores each contact in a contiguous 8-byte record at 0x8150. Read
+    // the bounded records in one transaction so every stored contact comes
+    // from one coherent controller frame.
+    const uint8_t storedCount = std::min<uint8_t>(count, MAX_TOUCH_CONTACTS);
+    uint8_t points[MAX_TOUCH_CONTACTS * 8] = {};
+    if (gt911ReadReg(0x8150, points, storedCount * 8)) {
       const auto& t = BoardConfig::ACTIVE.touch;
-      touchPoint.valid = true;
-      // Panel-native coordinates (calibrated raw range, touch panel's
-      // orientation); the app maps to its display/logical frame. Correct
-      // digitizer mounting so the touch frame matches the display NATIVE
-      // (panel) frame before any orientation mapping: swap axes first (rotated
-      // 90° sensor), then map with the panel-axis ranges, then per-axis flip.
-      const uint16_t sx = t.swapXY ? rawY : rawX;
-      const uint16_t sy = t.swapXY ? rawX : rawY;
-      touchPoint.x = mapTouchAxis(sx, t.rawMinX, t.rawMaxX, t.rawMaxX - t.rawMinX);
-      touchPoint.y = mapTouchAxis(sy, t.rawMinY, t.rawMaxY, t.rawMaxY - t.rawMinY);
-      if (t.flipX) touchPoint.x = static_cast<uint16_t>((t.rawMaxX - t.rawMinX) - touchPoint.x);
-      if (t.flipY) touchPoint.y = static_cast<uint16_t>((t.rawMaxY - t.rawMinY) - touchPoint.y);
-      touchPoint.timestamp = now;
+      touchSnapshot.reportedCount = count;
+      touchSnapshot.idsStable = !t.gt911CoordsAtByte0;
+      touchSnapshot.count = storedCount;
+      for (uint8_t i = 0; i < touchSnapshot.count; ++i) {
+        const uint8_t* record = points + i * 8;
+        touchSnapshot.points[i].id = t.gt911CoordsAtByte0 ? i : (record[0] & 0x0F);
+        const uint8_t offset = t.gt911CoordsAtByte0 ? 0 : 1;
+        const uint16_t rawX = static_cast<uint16_t>(record[offset]) | (static_cast<uint16_t>(record[offset + 1]) << 8);
+        const uint16_t rawY =
+            static_cast<uint16_t>(record[offset + 2]) | (static_cast<uint16_t>(record[offset + 3]) << 8);
+        TouchPoint& point = touchSnapshot.points[i].point;
+        point.valid = true;
+        // Panel-native coordinates (calibrated raw range, touch panel's
+        // orientation); the app maps to its display/logical frame. Correct
+        // digitizer mounting so the touch frame matches the display NATIVE
+        // (panel) frame before any orientation mapping: swap axes first, then
+        // map with the panel-axis ranges, then per-axis flip.
+        const uint16_t sx = t.swapXY ? rawY : rawX;
+        const uint16_t sy = t.swapXY ? rawX : rawY;
+        point.x = mapTouchAxis(sx, t.rawMinX, t.rawMaxX, t.rawMaxX - t.rawMinX);
+        point.y = mapTouchAxis(sy, t.rawMinY, t.rawMaxY, t.rawMaxY - t.rawMinY);
+        if (t.flipX) point.x = static_cast<uint16_t>((t.rawMaxX - t.rawMinX) - point.x);
+        if (t.flipY) point.y = static_cast<uint16_t>((t.rawMaxY - t.rawMinY) - point.y);
+        point.timestamp = now;
+      }
+
+      // Gesture state consumes only completed controller frames. A failed
+      // status/point read above deliberately does not arrive here, preserving
+      // the active sequence through transient I2C failures.
+      updateMultiTouchGesture(touchSnapshot, now);
+
+      // Preserve the existing single-touch API from the first contact.
+      touchPoint = touchSnapshot.points[0].point;
       if (!touchPressed) {
         touchPressedEvent = true;
         touchDownPoint = touchPoint;  // first contact sample, used for tap
@@ -1441,16 +1797,28 @@ void InputManager::pollGt911(const unsigned long now) {
       if (absInt(dx) > TOUCH_TAP_RELEASE_SLOP_PX || absInt(dy) > TOUCH_TAP_RELEASE_SLOP_PX) {
         touchMovedBeyondTapReleaseSlop = true;
       }
+      // A multi-contact gesture must not become a primary-contact tap in
+      // existing single-touch consumers.
+      if (touchSnapshot.reportedCount > 1) {
+        touchMovedBeyondTapSlop = true;
+        touchMovedBeyondTapReleaseSlop = true;
+      }
 #ifdef TOUCH_PROBE_DEBUG
       if (!touchPressed)
-        touchDebugPrintf(
-            "[touch] press pt=[%02X %02X %02X %02X %02X %02X %02X "
-            "%02X] raw=(%u,%u) mapped=(%u,%u)\n",
-            pt[0], pt[1], pt[2], pt[3], pt[4], pt[5], pt[6], pt[7], rawX, rawY, touchPoint.x, touchPoint.y);
+        touchDebugPrintf("[touch] press contacts=%u primary=(%u,%u)\n", touchSnapshot.count, touchPoint.x,
+                         touchPoint.y);
 #endif
       touchPressed = true;
+    } else {
+      // Retain the last complete snapshot until the controller provides an
+      // authoritative contact count. The existing single-touch state is also
+      // retained on this transient point-read failure.
     }
   } else {
+    touchSnapshot.count = 0;
+    touchSnapshot.reportedCount = 0;
+    touchSnapshot.idsStable = !BoardConfig::ACTIVE.touch.gt911CoordsAtByte0;
+    updateMultiTouchGesture(touchSnapshot, now);
     if (touchPressed) {
       touchReleasedEvent = true;
       lastTouchHeldDurationMs = now - touchDownPoint.timestamp;
