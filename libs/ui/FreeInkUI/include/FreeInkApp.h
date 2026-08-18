@@ -130,8 +130,13 @@ public:
     header(props, anchor);
   }
 
+  // `height` overrides the theme's header band for screens that draw less than
+  // a full header (no battery strip, no subtitle): 0 = the theme value. The
+  // band is what separates the title from the content below it, so a screen
+  // that leaves most of it empty pays for the emptiness in dead space.
   void header(const HeaderProps &props,
-              LayoutAnchor anchor = LayoutAnchor::Top) {
+              LayoutAnchor anchor = LayoutAnchor::Top,
+              int16_t height = 0) {
     HeaderProps themed = props;
     if (textStyleUnset(themed.titleText)) {
       themed.titleText = theme_.titleText;
@@ -157,7 +162,8 @@ public:
       themed.styles.normal.borderWidth = theme_.headerUnderline;
     }
     themed.minTouchSize = theme_.minTouchSize;
-    ui::header(frame_, take(anchor, theme_.headerHeight), themed);
+    ui::header(frame_, take(anchor, height > 0 ? height : theme_.headerHeight),
+               themed);
   }
 
   // Sub-screen chrome: leading back button + centered title, with an optional
@@ -245,14 +251,16 @@ public:
   void list(const ListProps &props, int16_t height = 0,
             LayoutAnchor anchor = LayoutAnchor::Top) {
     ListProps themed = props;
-    if (textStyleUnset(themed.labelText))
-      themed.labelText = theme_.bodyText;
-    if (textStyleUnset(themed.subtitleText))
-      themed.subtitleText = theme_.smallText;
-    if (textStyleUnset(themed.valueText))
-      themed.valueText = theme_.smallText;
-    if (textStyleUnset(themed.headerText))
-      themed.headerText = theme_.smallText;
+    if (!themed.textStylesExplicit) {
+      if (textStyleUnset(themed.labelText))
+        themed.labelText = theme_.bodyText;
+      if (textStyleUnset(themed.subtitleText))
+        themed.subtitleText = theme_.smallText;
+      if (textStyleUnset(themed.valueText))
+        themed.valueText = theme_.smallText;
+      if (textStyleUnset(themed.headerText))
+        themed.headerText = theme_.smallText;
+    }
     if (themed.rowStyles.unset()) {
       // Expand the theme's selection style over its base row styles; explicit
       // rowStyles or a caller-set marker win.

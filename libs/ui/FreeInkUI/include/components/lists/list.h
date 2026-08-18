@@ -54,6 +54,13 @@ struct ListProps {
   TextStyle labelText{};
   TextStyle subtitleText{};
   TextStyle valueText{};
+  // Set when the text styles above are already the caller's final choice.
+  // Screen::list() substitutes theme styles for any style that is entirely
+  // default-constructed, which it cannot distinguish from a caller that
+  // deliberately asked for the theme's smallText (all-default, and its font
+  // slot is 0) — the reason callers have had to bold a style just to mark it
+  // as owned. Set this instead and the substitution is skipped wholesale.
+  bool textStylesExplicit = false;
   StyleSet rowStyles{};
   // Inherit sentinels: Screen::list() substitutes the theme value for
   // rowHeight <= 0, rowGap < 0, sidePadding < 0, and rowRadius == 0; raw
@@ -84,6 +91,14 @@ struct ListProps {
   uint8_t toggleKnobRadius = 0;
   int16_t toggleKnobInset = 3;
   uint8_t toggleBorderWidth = 1;
+  // Minimum vertical padding a subtitle row keeps around its label+subtitle
+  // block when rowHeight is too tight to spare any of its own. A two-line row
+  // laid out on a ONE-line rowHeight otherwise comes out exactly
+  // labelLine + subtitleLine tall, with the text flush against both row edges
+  // and against the neighbouring rows. Compare the theme's own two-line row,
+  // themeTokensForLineHeight(): lineHeight * 2 + 8, where the 8 is this.
+  // 0 = padding only from whatever rowHeight spares (previous behaviour).
+  int16_t subtitleRowPadding = 0;
   // Horizontal inset of the ROWS within the rect (the Lyra pill band). The
   // scroll indicator stays at the rect's edge, in the inset margin.
   // -1 = inherit: Screen::list() substitutes the theme's listInset.
@@ -298,7 +313,18 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
       props.scrollIndicatorInset < 0 ? 0 : props.scrollIndicatorInset;
   const int16_t rowInset = props.rowInset < 0 ? 0 : props.rowInset;
   const uint16_t visible = listVisibleRows(rect, rowH, rowGap);
-  const bool overflows = props.count > visible;
+  // Rows that wrap or carry a subtitle are taller than rowH, so the
+  // fixed-height estimate can claim a list fits when it does not. A nav that
+  // has already laid out carries the MEASURED page size; prefer it. Without
+  // this, a 12-row list that really shows 10 in a 15-row estimate draws no
+  // scroll indicator AND has its viewport pinned to 0 by the !overflows branch
+  // below, leaving the tail rows unreachable while it fights onListRendered's
+  // follow correction.
+  uint16_t page = visible;
+  if (props.nav && props.nav->drawnRows > 0 &&
+      static_cast<uint16_t>(props.nav->drawnRows) < visible)
+    page = static_cast<uint16_t>(props.nav->drawnRows);
+  const bool overflows = props.count > page;
   uint16_t top = props.topIndex;
   if (top > props.count - 1)
     top = props.count - 1;
@@ -308,8 +334,8 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
   // fewer than `visible`: the nav advances top, this clamp pulls it back, and
   // the last row(s) can never be drawn (the rebuild loop oscillates instead
   // of converging).
-  if (overflows && !props.nav && top > props.count - visible)
-    top = static_cast<uint16_t>(props.count - visible);
+  if (overflows && !props.nav && top > props.count - page)
+    top = static_cast<uint16_t>(props.count - page);
   if (!overflows)
     top = 0;
   const uint16_t end =
@@ -320,7 +346,11 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
     rowArea.x = static_cast<int16_t>(rowArea.x + rowInset);
     rowArea.width = static_cast<int16_t>(rowArea.width - rowInset * 2);
   }
-  if (props.scrollIndicator && overflows && scrollW > 0) {
+  // The track's width comes out of the rows here, but the thumb itself is
+  // drawn after the layout pass below: its position needs the MEASURED page
+  // size, which only exists once the rows have been laid out.
+  const bool showScroll = props.scrollIndicator && overflows && scrollW > 0;
+  if (showScroll) {
     // Rows only give up width when the row inset margin doesn't already
     // clear the track (plus its bezel inset) plus 2px of air.
     const int16_t needed = static_cast<int16_t>(scrollW + scrollInset + 2);
@@ -330,8 +360,6 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
       if (scrollLeft)
         rowArea.x = static_cast<int16_t>(rowArea.x + cut);
     }
-    drawListScrollIndicator(frame.target(), rect, props.count, visible, top,
-                            scrollW, scrollLeft ? 1 : 0, scrollInset);
   }
 
   // Cursor-based layout: section header rows are shorter than item rows, so
@@ -434,8 +462,10 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
                        .height
                  : subLh;
       const int16_t basePad = static_cast<int16_t>(rowH - labelLh - subLh);
-      const int16_t needed = static_cast<int16_t>(
-          labelLh * labelLines + subH + (basePad > 0 ? basePad : 0));
+      const int16_t pad =
+          basePad > props.subtitleRowPadding ? basePad : props.subtitleRowPadding;
+      const int16_t needed =
+          static_cast<int16_t>(labelLh * labelLines + subH + pad);
       if (needed > rowH)
         itemH = needed;
     } else if (labelLines > 1) {
@@ -721,6 +751,27 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
       }
     }
   }
+
+  if (showScroll) {
+    // Measured page size, not the fixed-height listVisibleRows() estimate:
+    // rows that wrap or carry a subtitle are taller than rowHeight, so fewer
+    // fit than the estimate predicts. ListNav clamps its viewport with the
+    // same measured count (scrollBy/onListRendered), so feeding the estimate
+    // here made the thumb saturate at the bottom of the track while the list
+    // could still scroll, and drew it too tall.
+    const uint16_t drawnPage = consumedIndexes > 0 ? consumedIndexes : page;
+    drawListScrollIndicator(frame.target(), rect, props.count, drawnPage, top,
+                            scrollW, scrollLeft ? 1 : 0, scrollInset);
+  }
+
+  // First build of a variable-height list: `page` above was still the
+  // fixed-height estimate, so an overflow it hid also hid the indicator and
+  // pinned the viewport. Ask for one more build now that the real page size is
+  // known. One-way — consumedIndexes never exceeds the estimate, so a list
+  // that overflowed cannot stop overflowing here and the loop converges.
+  if (props.nav && consumedIndexes > 0 && !overflows &&
+      props.count > consumedIndexes)
+    props.nav->rebuildNeeded = true;
 }
 
 } // namespace ui
