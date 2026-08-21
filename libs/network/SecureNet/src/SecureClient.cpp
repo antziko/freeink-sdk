@@ -210,6 +210,9 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
     const int err = wolfSSL_get_error(ssl, ret);
     if (!isWantIo(err)) {
       if (Serial) Serial.printf("[SecureClient] wolfSSL_connect failed (%s): %d\n", label, err);
+      // Keep the FIRST failure of this connect(): the auto-version attempt is the one that
+      // negotiated, and the TLS 1.2 fallback below would otherwise overwrite its verdict.
+      if (_lastHandshakeErr == 0) _lastHandshakeErr = err;
       failHandshake();
       return 0;
     }
@@ -218,11 +221,13 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
         Serial.printf("[SecureClient] handshake timeout (%s): last err %d, transport %s, free heap %u\n", label, err,
                       _transport.connected() ? "up" : "down", (unsigned)ESP.getFreeHeap());
       }
+      if (_lastHandshakeErr == 0) _lastHandshakeErr = err;
       failHandshake();
       return 0;
     }
     delay(5);
   }
+  _lastHandshakeErr = 0;  // a fallback that connects clears the failed attempt before it
   _connected = true;
   _tlsMs = millis() - tlsStart;
   _resumed = wolfSSL_session_reused(ssl) == 1;
@@ -256,6 +261,9 @@ void SecureClient::failHandshake() {
 }
 
 int SecureClient::connect(const char* host, uint16_t port) {
+  // Per connect(), not per attempt: connectWithMethod runs twice below and the caller
+  // reads one verdict.
+  _lastHandshakeErr = 0;
   // Negotiate the highest mutually supported version rather than pinning TLS 1.3:
   // self-hosted / Let's Encrypt nginx often tops out at TLS 1.2, and a 1.3-only
   // client fails those handshakes outright. v23 still selects 1.3 when the peer

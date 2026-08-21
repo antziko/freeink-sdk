@@ -309,6 +309,11 @@ class SecureHttpClient {
   // Pair it with !responseComplete() to say WHY a body stopped early — see
   // SecureClient::lastReadError().
   int lastTlsError() const { return _secure.lastReadError(); }
+  // wolfSSL error from a handshake that never completed, 0 if the last one did (or on a
+  // plain-HTTP hop). lastTlsError() reports only the body, so it is 0 for every one of
+  // these — which left "out of memory", "peer refused" and "timed out" indistinguishable
+  // in a capture. See SecureClient::lastHandshakeError().
+  int lastHandshakeError() const { return _secure.lastHandshakeError(); }
   // True when the last https hop resumed a cached TLS session rather than running a full
   // handshake. Always false on a plain-HTTP hop. See SecureClient::sessionResumed().
   bool tlsSessionResumed() const { return _secure.sessionResumed(); }

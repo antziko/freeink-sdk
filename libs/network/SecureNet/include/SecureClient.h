@@ -59,6 +59,14 @@ class SecureClient : public Client {
   // on a serial-less device meant the one diagnostic that matters was never visible.
   int lastReadError() const { return _lastReadErr; }
 
+  // wolfSSL_get_error() code from the handshake that failed, or 0 if the last connect()
+  // completed one. lastReadError() covers only the body: it is set from read(), so a
+  // handshake that never completed always reported 0 there and every such failure in a
+  // capture looked identical -- out of memory, a peer that refused, and a timeout all
+  // printed tlsErr=0. A WANT_READ/WANT_WRITE value here means the deadline expired,
+  // since the fatal path can never store one.
+  int lastHandshakeError() const { return _lastHandshakeErr; }
+
   // True when the last handshake resumed a cached session instead of running a full one.
   // This is the only way to tell the two apart from a log: both end in "handshake ok".
   bool sessionResumed() const { return _resumed; }
@@ -87,6 +95,7 @@ class SecureClient : public Client {
   void* _ctx = nullptr;  // WOLFSSL_CTX*
   bool _connected = false;
   int _lastReadErr = 0;  // see lastReadError()
+  int _lastHandshakeErr = 0;  // see lastHandshakeError()
   // Host of the session currently owned by _ssl, recorded only once the handshake
   // succeeds so that stop() files the session under the right key. A name that does not
   // fit is never cached: a truncated key could alias two hosts onto one session.
