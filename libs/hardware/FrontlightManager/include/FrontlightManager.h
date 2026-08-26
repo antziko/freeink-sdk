@@ -21,8 +21,10 @@ class FrontlightManager {
   // Bring up the PWM channel(s). No-op if the board has no frontlight.
   void begin();
 
-  // Set brightness as a 0-100 percentage. 0 turns the light off. On a warm/cool board
-  // this is the TOTAL brightness; the current color-temperature split is preserved.
+  // Set brightness as a 0-100 percentage, mapped to duty through a perceptual
+  // gamma-1.6554 curve (1% is the smallest non-zero duty step, not 1% linear
+  // duty). 0 turns the light off. On a warm/cool board this is the TOTAL
+  // brightness; the current color-temperature split is preserved.
   void setBrightness(uint8_t percent);
 
   // Set brightness with 8-bit control and a perceptual curve. Level 1 maps to the

@@ -859,10 +859,6 @@ bool FreeInkDisplay::supportsStripGrayscale() const {
   return !_inverted && _driver && _driver->supportsStripGrayscale();
 }
 
-bool FreeInkDisplay::supportsFactoryGrayscale() const {
-  return !_inverted && _driver && _driver->supportsFactoryGrayscale();
-}
-
 bool FreeInkDisplay::combinesGrayscaleBase() const { return _driver && _driver->combinesGrayscaleBase(); }
 
 void FreeInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
@@ -928,6 +924,14 @@ void FreeInkDisplay::controllerIdle() {
 
 void FreeInkDisplay::requestCompleteWaveformNextRefresh() {
   if (_driver) _driver->requestCompleteWaveformNextRefresh();
+}
+
+void FreeInkDisplay::setFullRefreshCompletesWaveform(bool enabled) {
+  if (_driver) _driver->setFullRefreshCompletesWaveform(enabled);
+}
+
+void FreeInkDisplay::setAccentPlaneSlot(uint8_t slot, const uint8_t* plane, uint8_t colorCode) {
+  if (_driver) _driver->setAccentPlaneSlot(slot, plane, colorCode);
 }
 
 void FreeInkDisplay::setFastRefreshCutoffMs(uint16_t ms) {

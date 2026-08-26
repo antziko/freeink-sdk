@@ -53,10 +53,14 @@ class FakeDrawTarget : public DrawTarget {
 
   Op ops[256]{};
   size_t opCount = 0;
+  mutable bool measuredForbiddenLabel = false;
+  bool drewForbiddenLabel = false;
   int16_t charWidth = 6;
   int16_t lineH = 12;
 
   Size measureText(FontId, const char* text, TextStyle) const override {
+    if (text != nullptr && std::strcmp(text, "must-not-measure") == 0)
+      measuredForbiddenLabel = true;
     return Size{static_cast<int16_t>(charWidth * static_cast<int16_t>(std::strlen(text))), lineH};
   }
   int16_t lineHeight(FontId) const override { return lineH; }
@@ -74,7 +78,9 @@ class FakeDrawTarget : public DrawTarget {
   void triangle(Point a, Point, Point c, Paint paint) override {
     record(Op::Triangle, Rect{a.x, a.y, static_cast<int16_t>(c.x - a.x), static_cast<int16_t>(c.y - a.y)}, paint);
   }
-  void text(Rect rect, const char*, TextStyle style) override {
+  void text(Rect rect, const char* text, TextStyle style) override {
+    if (text != nullptr && std::strcmp(text, "must-not-measure") == 0)
+      drewForbiddenLabel = true;
     record(Op::Text, rect, Paint::solid(style.color), 0, CornersAll, style.rotation);
   }
   void bitmap(Rect rect, BitmapRef, BitmapMode, Paint foreground, Rotation rotation) override {
@@ -632,6 +638,7 @@ void testListItemsWindow() {
   ListProps props;
   props.items = window;
   props.itemsWindowFirst = 10;
+  props.itemsWindowCount = 8;
   props.count = 100;
   props.topIndex = 12;
   props.selectedIndex = 14;
@@ -642,6 +649,67 @@ void testListItemsWindow() {
   CHECK_EQ(interactions.count(), 5u);
   CHECK_EQ(interactions.data()[0].value, 12);
   CHECK_EQ(interactions.data()[4].value, 16);
+}
+
+// The virtual window only needs rows that can actually be drawn. In
+// particular, list() must not measure an extra row after the viewport is full:
+// callers often store exactly the visible window, so that read would be past
+// their ListItem array.
+void testListItemsWindowStopsBeforePastEndMeasurement() {
+  FakeDrawTarget draw;
+  DeviceContext device = makeDevice();
+  InputSnapshot input;
+  InteractionBuffer<32> interactions;
+  Frame<32> frame(draw, device, input, interactions);
+
+  ListItem window[6]{};
+  for (int i = 0; i < 6; ++i) {
+    window[i].label = i == 5 ? "must-not-measure" : "row";
+    window[i].actionValue = static_cast<int16_t>(10 + i);
+  }
+
+  ListProps props;
+  props.items = window;
+  props.itemsWindowFirst = 10;
+  props.itemsWindowCount = 5;
+  props.count = 100;
+  props.topIndex = 10;
+  props.action = 9;
+  props.rowHeight = 19;
+  list(frame, Rect{0, 0, 480, 95}, props);  // exactly 5 visible rows
+
+  CHECK_EQ(interactions.count(), 5u);
+  CHECK(!draw.measuredForbiddenLabel);
+  CHECK(!draw.drewForbiddenLabel);
+}
+
+void testListItemsWindowSkipsUnavailablePartialPreview() {
+  FakeDrawTarget draw;
+  DeviceContext device = makeDevice();
+  InputSnapshot input;
+  InteractionBuffer<32> interactions;
+  Frame<32> frame(draw, device, input, interactions);
+
+  ListItem window[6]{};
+  for (int i = 0; i < 6; ++i) {
+    window[i].label = i == 5 ? "must-not-measure" : "row";
+    window[i].actionValue = static_cast<int16_t>(10 + i);
+  }
+
+  ListProps props;
+  props.items = window;
+  props.itemsWindowFirst = 10;
+  props.itemsWindowCount = 5;
+  props.count = 100;
+  props.topIndex = 10;
+  props.action = 9;
+  props.rowHeight = 20;
+  props.partialTrailingRow = true;
+  list(frame, Rect{0, 0, 480, 118}, props);  // five rows plus an 18px preview
+
+  CHECK_EQ(interactions.count(), 5u);
+  CHECK(!draw.measuredForbiddenLabel);
+  CHECK(!draw.drewForbiddenLabel);
 }
 
 void testListNavLayoutFeedback() {
@@ -3019,6 +3087,227 @@ void testTextArea() {
   CHECK(sawCaret);       // caret on the now-visible line 1
 }
 
+// Filled-capsule slider: one track fill, a value-proportional stadium fill,
+// an outline, and a round handle riding the fill boundary — and a drag-routed
+// hit over the whole pill.
+void testCapsuleSlider() {
+  FakeDrawTarget draw;
+  DeviceContext device = makeDevice();
+  InputSnapshot input;
+  InteractionBuffer<4> interactions;
+  Frame<4> frame(draw, device, input, interactions);
+
+  CapsuleSliderProps props;
+  props.value = 50;
+  props.max = 100;
+  props.action = 7;
+  capsuleSlider(frame, Rect{0, 0, 200, 56}, props);
+  CHECK_EQ(interactions.count(), 1u);
+  CHECK_EQ(interactions.data()[0].action, 7);
+  CHECK_EQ(interactions.data()[0].inputMask, static_cast<uint16_t>(InputTouch | InputDrag));
+  // track + value fill + handle fill; capsule outline + handle outline
+  CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Fill), 3u);
+  CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Stroke), 2u);
+  // stroke 2 -> inner {2,2,196,52}, cap 26, travel 144: at 50% the handle
+  // center lands at x=100 and the fill runs to its far edge (x=126).
+  CHECK_EQ(draw.ops[1].rect.width, 124);
+  CHECK_EQ(draw.ops[1].color, Color::Black);
+
+  // Narrower than the handle: nothing drawn, nothing registered — the step
+  // buttons beside it (sliderRow) still drive the value.
+  const size_t opsBefore = draw.opCount;
+  capsuleSlider(frame, Rect{0, 0, 50, 56}, props);
+  CHECK_EQ(interactions.count(), 1u);
+  CHECK_EQ(draw.opCount, opsBefore);
+}
+
+// Caption + [-][capsule][+][toggle]: caption texts drawn, all four hits
+// registered, and the capsule spanning the gap between the step buttons.
+void testSliderRow() {
+  FakeDrawTarget draw;
+  DeviceContext device = makeDevice();
+  InputSnapshot input;
+  InteractionBuffer<8> interactions;
+  Frame<8> frame(draw, device, input, interactions);
+
+  SliderRowProps props;
+  props.label = "Brightness";
+  props.value = "62%";
+  props.sliderValue = 62;
+  props.sliderAction = 1;
+  props.decrement = 2;
+  props.increment = 2;
+  props.decrementValue = -1;
+  props.incrementValue = 1;
+  props.toggleAction = 3;
+  sliderRow(frame, Rect{0, 0, 300, 76}, props);
+
+  // label + value readout (step glyphs are also text ops)
+  CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Text), 4u);
+  CHECK_EQ(interactions.count(), 4u);
+  int sawMinus = 0, sawPlus = 0, sawToggle = 0, sawDrag = 0;
+  for (size_t i = 0; i < interactions.count(); ++i) {
+    const Interaction &it = interactions.data()[i];
+    if (it.action == 2 && it.value == -1) ++sawMinus;
+    if (it.action == 2 && it.value == 1) ++sawPlus;
+    if (it.action == 3) ++sawToggle;
+    if (it.action == 1 && (it.inputMask & InputDrag)) {
+      ++sawDrag;
+      // caption is 12px + 8 gap: band y=20, height 56. Track spans the gap
+      // between the 56px step buttons: x 64..172 (plus at 180, toggle 244).
+      CHECK_EQ(it.rect.x, 64);
+      CHECK_EQ(it.rect.width, 108);
+    }
+  }
+  CHECK_EQ(sawMinus, 1);
+  CHECK_EQ(sawPlus, 1);
+  CHECK_EQ(sawToggle, 1);
+  CHECK_EQ(sawDrag, 1);
+}
+
+// Tile grid: one hit per tile carrying the item's id and state, checked tiles
+// filled solid, and the height helper matching the laid-out rows.
+void testTileGrid() {
+  FakeDrawTarget draw;
+  DeviceContext device = makeDevice();
+  InputSnapshot input;
+  InteractionBuffer<8> interactions;
+  Frame<8> frame(draw, device, input, interactions);
+
+  TileGridItem items[3];
+  items[0].label = "Night mode";
+  items[0].value = 10;
+  items[1].label = "Refresh";
+  items[1].value = 11;
+  items[1].state = StateChecked;
+  items[2].label = "Sleep";
+  items[2].value = 12;
+
+  TileGridProps props;
+  props.items = items;
+  props.count = 3;
+  props.action = 5;
+  props.tileHeight = 84;
+  CHECK_EQ(tileGridHeight(props.count, props.columns, props.tileHeight, props.gap), 180);
+  CHECK_EQ(tileGridHeight(0, props.columns, props.tileHeight, props.gap), 0);
+
+  tileGrid(frame, Rect{0, 0, 212, 180}, props);
+  CHECK_EQ(interactions.count(), 3u);
+  CHECK_EQ(interactions.data()[1].value, 11);
+  CHECK(hasState(interactions.data()[1].state, StateChecked));
+  CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Text), 3u);
+  // Checked tile (row 0, col 1: x=112, w=100) draws filled black; its
+  // neighbors stay white cards.
+  bool checkedFilled = false, normalWhite = false;
+  for (size_t i = 0; i < draw.opCount; ++i) {
+    const FakeDrawTarget::Op &op = draw.ops[i];
+    if (op.kind != FakeDrawTarget::Op::Fill) continue;
+    if (op.rect.x == 112 && op.rect.y == 0) checkedFilled = op.color == Color::Black;
+    if (op.rect.x == 0 && op.rect.y == 0) normalWhite = op.color == Color::White;
+  }
+  CHECK(checkedFilled);
+  CHECK(normalWhite);
+  // Second row starts below the first plus the gap.
+  CHECK_EQ(interactions.data()[2].rect.y, 96);
+}
+
+// Sheet chrome: body fill with corners rounded on the free edge, a rule and a
+// centered grabber along that edge, a dismiss hit over the rest of the
+// screen, and a content rect that excludes the grabber band.
+void testSheet() {
+  FakeDrawTarget draw;
+  DeviceContext device = makeDevice();
+  InputSnapshot input;
+  InteractionBuffer<4> interactions;
+  Frame<4> frame(draw, device, input, interactions);
+
+  SheetProps props;
+  props.dismissAction = 9;
+  const Rect rect{0, 0, 480, 300};
+  sheet(frame, rect, props);
+  CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Fill), 3u);  // body + rule + grabber
+  CHECK_EQ(draw.ops[0].corners, static_cast<uint8_t>(CornersBottom));
+  CHECK_EQ(draw.ops[1].rect.y, 298);  // 2px rule hugging the free edge
+  CHECK_EQ(draw.ops[1].rect.height, 2);
+  CHECK_EQ(draw.ops[2].rect.x, 204);  // 72px grabber, centered
+  CHECK_EQ(draw.ops[2].rect.y, 279);  // inset 16 above the free edge
+  CHECK_EQ(interactions.count(), 1u);
+  CHECK_EQ(interactions.data()[0].action, 9);
+  CHECK_EQ(interactions.data()[0].rect.y, 300);
+  CHECK_EQ(interactions.data()[0].rect.height, 500);
+
+  const Rect content = sheetContentRect(rect, props);
+  CHECK_EQ(content.height, 271);  // minus margin 8 + grabber 5 + inset 16
+
+  // Bottom-anchored: rule and grabber flip to the sheet's top edge, dismiss
+  // covers the screen above it.
+  FakeDrawTarget draw2;
+  InteractionBuffer<4> interactions2;
+  Frame<4> frame2(draw2, device, input, interactions2);
+  SheetProps bottom = props;
+  bottom.anchor = SheetEdge::Bottom;
+  sheet(frame2, Rect{0, 500, 480, 300}, bottom);
+  CHECK_EQ(draw2.ops[0].corners, static_cast<uint8_t>(CornersTop));
+  CHECK_EQ(draw2.ops[1].rect.y, 500);
+  CHECK_EQ(draw2.ops[2].rect.y, 516);
+  CHECK_EQ(interactions2.data()[0].rect.y, 0);
+  CHECK_EQ(interactions2.data()[0].rect.height, 500);
+}
+
+// The themed Screen wrappers for the control-center pieces: sheet() clamps
+// the content area to the sheet's usable part, and sliderRow()/tileGrid()
+// reserve exactly the bands their content needs.
+void testScreenControlCenterWrappers() {
+  FakeDrawTarget draw;
+  DeviceContext device = makeDevice();
+  InputSnapshot input;
+  InteractionBuffer<16> interactions;
+  Frame<16> frame(draw, device, input, interactions);
+  ThemeTokens theme;
+  Screen<16> screen(frame, theme);
+
+  SheetProps panel;
+  const Rect content = screen.sheet(panel, 400);
+  // Free-edge band: margin 8 + grabber 5 + inset 16.
+  CHECK_EQ(content.height, 371);
+  CHECK_EQ(screen.body().y, 0);
+  CHECK_EQ(screen.body().height, 371);
+
+  SliderRowProps row;
+  row.label = "Brightness";
+  row.value = "62%";
+  row.sliderValue = 62;
+  row.sliderAction = 1;
+  row.decrement = 2;
+  row.increment = 2;
+  screen.sliderRow(row);
+  // capsule (drag) + two step buttons
+  CHECK_EQ(interactions.count(), 3u);
+  // caption line (12) + spaceMd + control band (minTouchSize 44 + 12) + gap
+  CHECK_EQ(screen.body().y, 12 + 8 + 56 + 8);
+
+  TileGridItem items[2];
+  items[0].label = "Night mode";
+  items[0].value = 0;
+  items[1].label = "Refresh";
+  items[1].value = 1;
+  TileGridProps grid;
+  grid.items = items;
+  grid.count = 2;
+  grid.action = 3;
+  const int16_t before = screen.body().y;
+  screen.tileGrid(grid);
+  CHECK_EQ(interactions.count(), 5u);
+  // one 84px row (2*minTouchSize-4) + spaceSm gap
+  CHECK_EQ(screen.body().y, static_cast<int16_t>(before + 84 + 4));
+
+  CapsuleSliderProps capsule;
+  capsule.value = 30;
+  capsule.action = 4;
+  screen.capsuleSlider(capsule, 56);
+  CHECK_EQ(interactions.count(), 6u);
+}
+
 }  // namespace
 
 int main() {
@@ -3041,6 +3330,8 @@ int main() {
   testListVirtualization();
   testListClampsBadTopIndex();
   testListItemsWindow();
+  testListItemsWindowStopsBeforePastEndMeasurement();
+  testListItemsWindowSkipsUnavailablePartialPreview();
   testListNavLayoutFeedback();
   testListNavConvergesThroughRealList();
   testListCanUseFullTitleWidthWithShortValue();
@@ -3093,6 +3384,11 @@ int main() {
   testFreeInkAppHandlerOverflowFlag();
   testFreeInkAppSharedThemeRefFollowsAtomicSwap();
   testTextArea();
+  testCapsuleSlider();
+  testSliderRow();
+  testTileGrid();
+  testSheet();
+  testScreenControlCenterWrappers();
 
   std::printf("%d checks, %d failed\n", checksRun, checksFailed);
   return checksFailed == 0 ? 0 : 1;

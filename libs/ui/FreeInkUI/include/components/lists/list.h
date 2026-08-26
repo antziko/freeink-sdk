@@ -43,6 +43,12 @@ struct ListProps {
   // so the caller must keep the window covering that range (refresh it after
   // viewport changes, before list()). 0 = items is the full array.
   uint16_t itemsWindowFirst = 0;
+  // Number of ListItems supplied in `items` when it is a virtual window.
+  // Set this whenever itemsWindowFirst is non-zero (or the supplied array is
+  // otherwise shorter than count), so optional previews can stay within the
+  // materialized data. 0 preserves the full-array behavior for existing
+  // callers.
+  uint16_t itemsWindowCount = 0;
   // First item index drawn at the top of the rect. The list is virtualized:
   // only the rows that fully fit inside the rect are laid out, drawn, and
   // registered for interaction. Use listVisibleRows()/listTopIndexFor() to
@@ -373,6 +379,12 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
   uint16_t consumedIndexes = 0; // item AND header indexes laid out from top
   bool selectedDrawn = false;
   for (uint16_t i = top; i < props.count; ++i) {
+    // Stop before reading the next window entry. The size/layout work below
+    // dereferences `item`, so checking after it would require callers that
+    // virtualize their data to provide one extra, otherwise out-of-window row.
+    if (drawnRows >= visible || i >= end || i < props.itemsWindowFirst ||
+        (props.itemsWindowCount > 0 && i - props.itemsWindowFirst >= props.itemsWindowCount))
+      break;
     const ListItem &item = props.items[i - props.itemsWindowFirst];
     if (item.isHeader) {
       const int16_t pad = i != top ? props.sectionGap : 0;
@@ -471,8 +483,7 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
     } else if (labelLines > 1) {
       itemH = static_cast<int16_t>(rowH + labelLh * (labelLines - 1));
     }
-    if (static_cast<int16_t>(cursorY + itemH) > rowArea.bottom() ||
-        drawnRows >= visible || i >= end)
+    if (static_cast<int16_t>(cursorY + itemH) > rowArea.bottom())
       break;
     ++drawnRows;
     ++consumedIndexes;
@@ -684,10 +695,15 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
   if (props.nav)
     props.nav->onListRendered(top, consumedIndexes, selectedDrawn);
 
-  if (props.partialTrailingRow && overflows && visible > 0) {
-    const uint16_t partialIndex = static_cast<uint16_t>(top + visible);
+  if (props.partialTrailingRow && visible > 0) {
+    // First index the loop above did NOT lay out. With wrapped rows fewer
+    // indexes fit than the fixed-height `visible` estimate, so top + visible
+    // would preview an item past the real next one (skipping the rows in
+    // between — pressing Next then selects a different item than previewed).
+    const uint16_t partialIndex = static_cast<uint16_t>(top + consumedIndexes);
     const int16_t remainingH = static_cast<int16_t>(rowArea.bottom() - cursorY);
-    if (partialIndex < props.count &&
+    if (partialIndex < props.count && partialIndex >= props.itemsWindowFirst &&
+        (props.itemsWindowCount == 0 || partialIndex - props.itemsWindowFirst < props.itemsWindowCount) &&
         remainingH >= props.partialTrailingMinHeight) {
       const ListItem &item = props.items[partialIndex - props.itemsWindowFirst];
       if (!item.isHeader && item.label != nullptr && item.label[0] != '\0') {

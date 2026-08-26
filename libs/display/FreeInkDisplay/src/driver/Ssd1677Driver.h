@@ -85,7 +85,6 @@ class Ssd1677Driver : public PanelDriver {
   void seedPreviousFrame(EpdBus& bus, const uint8_t* buf) override;
 
   bool supportsStripGrayscale() const override { return true; }
-  bool supportsFactoryGrayscale() const override { return true; }
   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;
   void writeGrayscalePlaneStrip(EpdBus& bus, GrayPlane plane, const uint8_t* rows, uint16_t yStart,

@@ -626,6 +626,15 @@ enum class SelectionStyle : uint8_t {
   Triangle,   // rows keep their normal style; triangle marker
 };
 
+// Sentinel for radius props: inherit the theme's shape token. Screen wrappers
+// substitute the matching ThemeTokens value; components rendered on a bare
+// Frame resolve it to their classic default via resolveRadius().
+inline constexpr uint8_t RADIUS_INHERIT = 0xFF;
+
+inline uint8_t resolveRadius(const uint8_t propRadius, const uint8_t fallback) {
+  return propRadius == RADIUS_INHERIT ? fallback : propRadius;
+}
+
 struct ThemeTokens {
   FontId fontSmall = 0;
   FontId fontBody = 0;
@@ -658,6 +667,15 @@ struct ThemeTokens {
   int16_t headerSidePadding = 6;
   uint8_t headerUnderline = 1; // bottom rule thickness; 0 = none
   TextAlign headerTitleAlign = TextAlign::Left;
+  // Control shape tokens, forwarded into any radius prop left at
+  // RADIUS_INHERIT: quick-setting tiles and slider step buttons
+  // (Screen::tileGrid()/sliderRow()), the sheet's free-edge corners
+  // (Screen::sheet()), and the capsule slider's corners — a capsuleRadius of
+  // at least half the control's height draws the classic full stadium,
+  // smaller values square it toward the theme's card language.
+  uint8_t controlRadius = 18;
+  uint8_t sheetRadius = 0;
+  uint8_t capsuleRadius = 255;
   TextStyle smallText{};
   TextStyle bodyText{};
   TextStyle titleText{};

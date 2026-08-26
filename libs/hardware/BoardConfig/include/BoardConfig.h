@@ -256,9 +256,9 @@
 // On-board I2C sensors. Each lib (Rtc / EnvironmentSensor / Imu) compiles its
 // I2C driver only when its flag is set; otherwise it links stub bodies.
 #ifndef FREEINK_CAP_RTC
-#define FREEINK_CAP_RTC \
+#define FREEINK_CAP_RTC                                                                             \
   (FREEINK_DEVICE_X3 || FREEINK_DEVICE_STICKY || FREEINK_DEVICE_X4PRO || FREEINK_DEVICE_PAPERMONO || \
-   FREEINK_DEVICE_PAPERS3)
+   FREEINK_DEVICE_PAPERS3 || FREEINK_DEVICE_LILYGO)
 #endif
 #ifndef FREEINK_CAP_TEMP_HUMIDITY
 #define FREEINK_CAP_TEMP_HUMIDITY (FREEINK_DEVICE_STICKY)
@@ -693,9 +693,15 @@ constexpr TouchConfig NO_TOUCH = {TouchController::None,
 // LilyGo T5 S3 Pro Lite GT911 touch (shared I2C bus). The digitizer reports a
 // portrait 540x960 frame on the landscape 960x540 panel, so swap axes into the
 // panel-native display frame before app-level orientation mapping.
+// hasHomeKey=true: the board HAS a capacitive home key below the panel. The vendor
+// wiki's button list ("RST + BOOT + IO48 + PWR") omits it entirely, so it was found
+// by tracing the GT911 status bit (0x10) on hardware. InputManager reads that bit
+// unconditionally, so detection always worked -- it was the consumers gated on this
+// flag (wasHomeGesture()/wasHomeKeyHold()) that discarded every press. On a board
+// with one physical nav key that is a real loss.
 constexpr TouchConfig LILYGO_T5_PRO_GT911 = {
-    TouchController::Gt911, 39,   40,    3,   9, 0x5D, 0, 959, 0, 539, false, 0x14, false, true,
-    PIN_UNASSIGNED,         true, false, true};  // powerEnable, swapXY=true, flipX=false, flipY=true
+    TouchController::Gt911, 39,   40,    3,    9, 0x5D, 0, 959, 0, 539, false, 0x14, false, true,
+    PIN_UNASSIGNED,         true, false, true, true};  // powerEnable, swapXY, flipX, flipY, hasHomeKey
 constexpr FrontlightConfig NO_FRONTLIGHT = {PIN_UNASSIGNED, 0, 0, true};
 constexpr AudioConfig NO_AUDIO = {AudioOutput::None,
                                   PIN_UNASSIGNED,
@@ -1136,11 +1142,23 @@ constexpr BoardProfile LILYGO_T5S3 = {
     NO_SDMMC,
     {39, 40, 400000, 0x55, 0x6B},  // BQ27220 gauge (0x55) + BQ25896 charger (0x6B) on SDA39/SCL40
     NO_MIC,
-    NO_SENSORS,
+    // Battery-backed RTC on the shared main I2C bus. The vendor schematic
+    // (hardware/T5 E-paper S3 Pro V1.0 24-12-24.pdf, page 3 / U3) shows a
+    // PCF8563TS at 0x51; the README's product table says PCF85063, and the
+    // vendor's own docs/pinmap.md notes say to prefer the schematic and the
+    // mounted part. Was NO_SENSORS, so the board kept time in software and lost
+    // it whenever power was actually cut rather than merely deep-slept.
+    {39, 40, 400000, 0x51, 0, 0, 0, RtcType::Pcf8563, ImuType::None},
     1.2f,  // uiScale: 4.7" 960x540 touch (~234 PPI) — finger-sized chrome, like Sticky
     // Power latch: main-power MOSFET on GPIO2, driven HIGH first thing in boot
     // via holdPowerRails() or the board powers off when USB is unplugged.
-    {2}};
+    {2},
+    0,  // displayControllerVariant: not probed on this panel
+    // Bezel: this case sits closer over the glass at the sides than the X4's, so
+    // the default 3px leaves the first and last characters of a line hard to
+    // read. Measured by eye on hardware in two passes (3 -> 6 -> 8); top/bottom
+    // are correct at the defaults. Compare the X4 Pro's 7px sides.
+    {9, 8, 3, 8}};
 
 // --- M5Paper v1.1 4.7" (ED047TC1 behind an IT8951E controller) — ESP32 --------
 // 540x960 16-gray panel driven through an IT8951E timing controller over SPI
