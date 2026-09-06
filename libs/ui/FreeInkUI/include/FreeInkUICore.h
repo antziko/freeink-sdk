@@ -1160,6 +1160,14 @@ private:
   // they don't have the torn-read hazard count_/interactions_ have.
   int16_t focused_ = -1;
   int16_t active_ = -1;
+  // Mirrors the last routed frame's contact, so its opening frame is visible.
+  bool contactHeld_ = false;
+  // Last x a bound drag dispatched from, -1 until the contact drags. A
+  // released drag commits from here: the release edge itself carries either
+  // the tap classifier's touch-DOWN point (contacts under the swipe
+  // threshold) or off-target -1,-1 coords, so routing the release like a tap
+  // snaps the value back to where the drag STARTED (or drops it entirely).
+  int16_t lastDragX_ = -1;
   ActionId flashAction_ = NO_ACTION; // tap-flash target (see setFlash)
   int16_t flashValue_ = 0;
 
@@ -1187,8 +1195,10 @@ private:
       if (hasState(interaction.state, StateDisabled))
         continue;
       const bool acceptsKind = acceptsInput(interaction.inputMask, kind);
+      // InputTouch is the catch-all for tap-style kinds; long-press and drag
+      // are opt-in, so a plain button never absorbs them.
       const bool acceptsTouchFallback =
-          kind != InputLongPress &&
+          kind != InputLongPress && kind != InputDrag &&
           acceptsInput(interaction.inputMask, InputTouch);
       if (!acceptsKind && !acceptsTouchFallback)
         continue;
@@ -1244,6 +1254,28 @@ private:
     ActionEvent event{};
     const size_t slotCount = count_[slot];
 
+    // touchPressed is gated on the contact first reading as a tap, which a
+    // fast drag never is. Bind on the frame the contact begins, at the point
+    // it landed — the live position would let a passing contact grab a
+    // slider. Drag-masked elements only, so taps keep press-then-release;
+    // a contact starting elsewhere clears whatever the last one bound.
+    // The latch closes on hold and opens on the release edge, never on the
+    // mere absence of a hold: render() routes a default-constructed snapshot
+    // through this same buffer on every repaint, and a drag repaints every
+    // frame. Clearing on !touchHeld would let that placeholder re-open the
+    // latch between two input frames, making every held frame read as a fresh
+    // contact — the bind below would then re-run against the live position and
+    // drop the drag the moment the finger leaves the rect.
+    const bool contactBegan = input.touchHeld && !contactHeld_;
+    if (input.touchHeld) contactHeld_ = true;
+    if (input.touchReleased) contactHeld_ = false;
+    if (contactBegan) {
+      active_ = findTouch(slot, input.touchX, input.touchY, InputDrag);
+      lastDragX_ = -1;
+    }
+
+    // Runs second so an adapter reporting both edges on one frame keeps its
+    // pressed-element highlight.
     if (input.touchPressed) {
       active_ = findTouch(slot, input.touchX, input.touchY, InputTouch);
     }
@@ -1257,11 +1289,29 @@ private:
           acceptsInput(held.inputMask, InputDrag)) {
         ActionEvent dragged = eventFor(slot, active_);
         dragged.dragPermille = dragPermilleFor(held.rect, input.touchX);
+        lastDragX_ = input.touchX;
         return dragged;
       }
     }
 
     if (input.touchReleased) {
+      // A contact that dragged commits as a drag, at the last held position
+      // (grab semantics: even off the rect). It must not fall through to the
+      // tap path below, whose coordinates are the touch-down point.
+      if (lastDragX_ >= 0 && active_ >= 0 &&
+          active_ < static_cast<int16_t>(slotCount)) {
+        const Interaction &held = interactions_[slot][active_];
+        const int16_t releaseIdx = active_;
+        active_ = -1;
+        if (!hasState(held.state, StateDisabled) &&
+            acceptsInput(held.inputMask, InputDrag)) {
+          ActionEvent released = eventFor(slot, releaseIdx);
+          released.dragPermille = dragPermilleFor(held.rect, lastDragX_);
+          lastDragX_ = -1;
+          return released;
+        }
+      }
+      lastDragX_ = -1;
       const int16_t idx =
           findTouch(slot, input.touchX, input.touchY,
                     input.longPress ? InputLongPress : InputTouch);
@@ -1654,6 +1704,26 @@ inline BitmapRef lucideDeleteIcon16() {
       0xF3, 0xFD, 0xF8, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
   };
   return BitmapRef{bits, 16, 16, BitmapFormat::Mask1};
+}
+
+// Lucide's globe at 32px, the size the key sizer lands on for a keyboard row.
+// Half that is not enough: the disc, its two meridians and the equator have no
+// detail to spare, and nothing else in the set needs this much room.
+inline BitmapRef lucideGlobeIcon32() {
+  static constexpr uint8_t bits[] = {
+      0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC, 0x3F, 0xFF,
+      0xFF, 0xE0, 0x07, 0xFF, 0xFF, 0x80, 0x01, 0xFF, 0xFE, 0x00, 0x00, 0x7F,
+      0xFC, 0x18, 0x18, 0x3F, 0xF8, 0x71, 0x8E, 0x1F, 0xF8, 0xF1, 0x8F, 0x1F,
+      0xF1, 0xE3, 0xC7, 0x8F, 0xF1, 0xE3, 0xC7, 0x8F, 0xE3, 0xE3, 0xC7, 0xC7,
+      0xE3, 0xE7, 0xE7, 0xC7, 0xE7, 0xC7, 0xE3, 0xE7, 0xC7, 0xC7, 0xE3, 0xE3,
+      0xC0, 0x00, 0x00, 0x03, 0xC0, 0x00, 0x00, 0x03, 0xC7, 0xC7, 0xE3, 0xE3,
+      0xE7, 0xC7, 0xE3, 0xE7, 0xE3, 0xE7, 0xE7, 0xC7, 0xE3, 0xE3, 0xC7, 0xC7,
+      0xF1, 0xE3, 0xC7, 0x8F, 0xF1, 0xE3, 0xC7, 0x8F, 0xF8, 0xF1, 0x8F, 0x1F,
+      0xF8, 0x71, 0x8E, 0x1F, 0xFC, 0x18, 0x18, 0x3F, 0xFE, 0x00, 0x00, 0x7F,
+      0xFF, 0x80, 0x01, 0xFF, 0xFF, 0xE0, 0x07, 0xFF, 0xFF, 0xFC, 0x3F, 0xFF,
+      0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+  };
+  return BitmapRef{bits, 32, 32, BitmapFormat::Mask1};
 }
 
 inline void drawBorderEdges(DrawTarget &target, Rect rect, Paint paint,

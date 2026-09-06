@@ -74,6 +74,31 @@ FsBlockDeviceInterface* SDCardManager::detachFilesystemForRawAccess() {
   cachedUsedBytesValid = false;
   return _dev;
 }
+
+void SDCardManager::shutdown() {
+  if (!initialized || !_dev) return;
+  // FsVolume::end() flushes SdFat's cached FAT/directory sectors; SDMMC block
+  // writes are synchronous, so the card is consistent once it returns.
+  _vol.end();
+  _dev->end();  // frees the card and runs sdmmc_host_deinit()
+  // sdmmc_host_deinit() leaves the bus pads in their last GPIO-matrix state:
+  // CLK/CMD/D0-D3 idle high and back-feed the card's VDD net through the bus
+  // pull-ups for the whole sleep (VDD measures 3.3 V with the enable gate
+  // driven off). Float the pads so the net can fall; the sleep path's
+  // esp_sleep_config_gpio_isolate() keeps them isolated.
+  const BoardConfig::SdmmcPins& p = BoardConfig::ACTIVE.sdmmc;
+  for (const int8_t pin : {p.clk, p.cmd, p.d0, p.d1, p.d2, p.d3}) {
+    if (pin < 0) continue;
+    const auto g = static_cast<gpio_num_t>(pin);
+    gpio_set_direction(g, GPIO_MODE_INPUT);
+    gpio_pullup_dis(g);
+    gpio_pulldown_dis(g);
+  }
+  initialized = false;
+  cachedTotalBytes = 0;
+  cachedUsedBytes = 0;
+  cachedUsedBytesValid = false;
+}
 #else
 SDCardManager::SDCardManager() : sd() {}
 
@@ -113,7 +138,7 @@ bool SDCardManager::begin() {
     pinMode(BoardConfig::ACTIVE.sd.powerEnable, OUTPUT);
     // ON level: HIGH for active-high enables, LOW for active-low ones.
     digitalWrite(BoardConfig::ACTIVE.sd.powerEnable, BoardConfig::ACTIVE.sd.powerActiveHigh ? HIGH : LOW);
-    delay(10);
+    delay(BoardConfig::isOnePage() ? 80 : 10);
   }
 
   // Shared SPI bus: when the display controller sits on the same SCLK as the SD
@@ -126,11 +151,34 @@ bool SDCardManager::begin() {
     digitalWrite(BoardConfig::ACTIVE.display.cs, HIGH);
   }
 
-  if (SD_SCLK >= 0 && SD_MOSI >= 0 && SD_MISO >= 0) {
-    SPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
+  // A board with a dedicated SD SPI bus (separateSpi) MUST NOT reconfigure the
+  // global SPI object: that bus belongs to the display, and Arduino's second
+  // SPI.begin() won't remap its pins, so the panel would end up transmitting on
+  // the SD pins. Give SD its own HSPI instance and leave the global SPI for the
+  // display. Other boards keep sharing the global SPI as before.
+  bool cardReady = false;
+#if FREEINK_MCU_S3 || FREEINK_MCU_ESP32
+  if (BoardConfig::ACTIVE.sd.separateSpi && SD_SCLK >= 0 && SD_MOSI >= 0 && SD_MISO >= 0) {
+    static SPIClass dedicatedSdSpi(HSPI);
+    cardReady = dedicatedSdSpi.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS) &&
+                sd.begin(SdSpiConfig(SD_CS, SHARED_SPI | USER_SPI_BEGIN, SPI_FQ, &dedicatedSdSpi));
+  } else {
+#endif
+    if (SD_SCLK >= 0 && SD_MOSI >= 0 && SD_MISO >= 0) {
+      SPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
+    }
+    // Other boards keep the single attempt so a missing card fails fast.
+    const int attempts = BoardConfig::isOnePage() ? 5 : 1;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+      cardReady = sd.begin(SD_CS, SPI_FQ);
+      if (cardReady || attempt + 1 == attempts) break;
+      delay(80);
+    }
+#if FREEINK_MCU_S3 || FREEINK_MCU_ESP32
   }
+#endif
 
-  if (!sd.begin(SD_CS, SPI_FQ)) {
+  if (!cardReady) {
     if (Serial)
       Serial.printf("[%lu] [SD] SD card not detected (err=0x%02X data=0x%02X cs=%d sclk=%d miso=%d mosi=%d clk=%luHz)\n",
                     millis(), sd.sdErrorCode(), sd.sdErrorData(), SD_CS, SD_SCLK,

@@ -2,7 +2,6 @@
 
 #include <BoardConfig.h>
 
-#include <algorithm>
 #include <vector>
 
 #include "../lut/Ssd1677Luts.h"
@@ -43,8 +42,8 @@ constexpr uint8_t SCAN_TB_FLIP = 0x01;        // OR into the scan byte for mirro
 }  // namespace
 
 const Ssd1677Config& ssd1677DefaultConfig() {
-  // Xteink X4 / GDEQ0426T82 defaults. The stock X4 firmware's B/W update paths
-  // use absolute SSD1677 sequences rather than the incremental 0x1C assembly:
+  // Xteink X4 / GDEQ0426T82 defaults. The stock X4 paths and the X4 Pro 7.4.4
+  // SSD1677 firmware use absolute sequences rather than incremental 0x1C:
   // INIT:  0C=AE C7 C3 C0 80, 3C=80
   // FULL:  3C=C0, 22=F7, 20, ~1800 ms
   // HALF:  3C=C0, 1A=5A, 22=D7, 20
@@ -263,16 +262,6 @@ void Ssd1677Driver::writeRam(EpdBus& bus, uint8_t ramCmd, const uint8_t* data, u
   bus.data(data, static_cast<uint16_t>(size));
 }
 
-void Ssd1677Driver::writeRamInverted(EpdBus& bus, uint8_t ramCmd, const uint8_t* data, uint32_t size) {
-  uint8_t chunk[128];
-  bus.cmd(ramCmd);
-  for (uint32_t offset = 0; offset < size; offset += sizeof(chunk)) {
-    const uint32_t n = std::min<uint32_t>(sizeof(chunk), size - offset);
-    for (uint32_t i = 0; i < n; ++i) chunk[i] = static_cast<uint8_t>(~data[offset + i]);
-    bus.data(chunk, static_cast<uint16_t>(n));
-  }
-}
-
 void Ssd1677Driver::refresh(EpdBus& bus, RefreshMode mode, bool turnOff, bool async) {
   _pendingPowerOff = false;
 #if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
@@ -465,20 +454,7 @@ void Ssd1677Driver::displayImpl(EpdBus& bus, const uint8_t* fb, const uint8_t* p
     writeRam(bus, CMD_WRITE_RAM_RED, fb, _bufferSize);
   } else {
     writeRam(bus, CMD_WRITE_RAM_BW, fb, _bufferSize);
-    if (_darkBackground) {
-      // Inverted content: the DU compare idles unchanged pixels, so the light
-      // residue of every white->black transition parks in the black background
-      // and accumulates between absolute cleans. Write RED as the complement of
-      // the target instead of the previous frame: every pixel then classifies
-      // as changed-toward-target and is re-driven — re-blackening the
-      // background (and re-whitening standing text) on every page turn, which
-      // is optically invisible on pixels already at their endpoint. Scan time
-      // is unchanged (the DU waveform length does not depend on how many
-      // pixels drive). Works identically in single-buffer mode, where no host
-      // copy of the previous frame exists. Same mechanism as the Paper Mono
-      // driver's dark-background selector and its forceAll corrective.
-      writeRamInverted(bus, CMD_WRITE_RAM_RED, fb, _bufferSize);
-    } else if (prev != nullptr) {
+    if (prev != nullptr) {
       // Dual-buffer: RED holds the previous frame for the differential compare.
       // Single-buffer (prev == nullptr): RED already holds it from last refresh.
       writeRam(bus, CMD_WRITE_RAM_RED, prev, _bufferSize);
@@ -532,19 +508,7 @@ void Ssd1677Driver::displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t*
   setRamArea(bus, x, y, w, h);
   writeRam(bus, CMD_WRITE_RAM_BW, windowBuffer.data(), windowBufferSize);
 
-  if (_darkBackground) {
-    // Inverted content: same as displayImpl()'s dark path — write the window's
-    // "old" plane as the complement of its target so every pixel in the window
-    // is re-driven toward its target. Without this, dismissing an overlay
-    // diffs against the true previous frame, the window's black background
-    // idles, and the overlay's light residue stays parked there (with nothing
-    // repainting afterwards to fade it).
-    std::vector<uint8_t> invertedWindow(windowBufferSize);
-    for (uint32_t i = 0; i < windowBufferSize; i++) {
-      invertedWindow[i] = static_cast<uint8_t>(~windowBuffer[i]);
-    }
-    writeRam(bus, CMD_WRITE_RAM_RED, invertedWindow.data(), windowBufferSize);
-  } else if (prev != nullptr) {
+  if (prev != nullptr) {
     std::vector<uint8_t> previousWindow(windowBufferSize);
     for (uint16_t row = 0; row < h; row++) {
       const uint16_t srcY = y + row;

@@ -307,10 +307,6 @@ bool Uc8179Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* p
       bus.cmd(CMD_DTM1);
       for (uint16_t y = 0; y < _tresH; y++) bus.data(whiteRow, wb);
     }
-  } else if (_darkBackground) {
-    // Inverted content uses the target complement even with DU so unchanged dark
-    // background pixels do not park residue.
-    streamPlane(bus, CMD_DTM1, fb, /*invert=*/true);
   }
   // (Ordinary Fast: OLD still holds the previous frame from displayFinish.)
   // A completed ordinary refresh supersedes any pending post-AA transition.

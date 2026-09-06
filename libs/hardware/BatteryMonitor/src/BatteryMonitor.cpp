@@ -308,10 +308,21 @@ BatteryMonitor::BatteryMonitor()
     : BatteryMonitor(BoardConfig::ACTIVE.batteryAdc, BoardConfig::ACTIVE.batteryDividerMultiplier,
                      BoardConfig::ACTIVE.batteryChargeStatus) {}
 
+namespace {
+// Level meaning "charging" on the charge-status pin, per the active board's
+// polarity. Active-low /STAT lines are open-drain and need the internal
+// pull-up; an active-high STAT (X4 Pro GPIO21) is push-pull driven with no
+// pull — stock reads it bare, and a pull-up would fake "charging" if the
+// driver ever tri-states.
+int chargeActiveLevel() {
+  return BoardConfig::ACTIVE.batteryChargeStatusActiveHigh ? HIGH : LOW;
+}
+}  // namespace
+
 BatteryMonitor::BatteryMonitor(int8_t adcPin, float dividerMultiplier, int8_t chargeStatusPin)
     : _adcPin(adcPin), _dividerMultiplier(dividerMultiplier), _chargeStatusPin(chargeStatusPin) {
   if (_chargeStatusPin >= 0) {
-    pinMode(_chargeStatusPin, INPUT_PULLUP);
+    pinMode(_chargeStatusPin, BoardConfig::ACTIVE.batteryChargeStatusActiveHigh ? INPUT : INPUT_PULLUP);
   }
 }
 
@@ -387,9 +398,15 @@ BatteryMonitor::Status BatteryMonitor::readStatus() const {
       status.millivolts = mv;
     }
     // Charging: from a dedicated charger IC when present, else the gauge's own
-    // Current() sign — so gauge-only boards (X3) report it too.
+    // Current() sign — so gauge-only boards (X3) report it too. A gauge that
+    // cannot observe charging at all (CW2017) leaves chargingKnown false; fall
+    // back to the charger's STAT pin when the board has one (X4 Pro GPIO21).
     bool chargingKnown = false;
-    const bool charging = readGaugeCharging(chargingKnown);
+    bool charging = readGaugeCharging(chargingKnown);
+    if (!chargingKnown && _chargeStatusPin >= 0) {
+      chargingKnown = true;
+      charging = digitalRead(_chargeStatusPin) == chargeActiveLevel();
+    }
     status.chargingKnown = chargingKnown;
     status.charging = charging;
     return status;
@@ -411,7 +428,7 @@ BatteryMonitor::Status BatteryMonitor::readStatus() const {
     }
     if (_chargeStatusPin >= 0) {
       status.chargingKnown = true;
-      status.charging = digitalRead(_chargeStatusPin) == LOW;
+      status.charging = digitalRead(_chargeStatusPin) == chargeActiveLevel();
     }
   }
   return status;
@@ -439,7 +456,20 @@ uint16_t BatteryMonitor::readMillivolts() const {
   const uint16_t mv = esp_adc_cal_raw_to_voltage(raw, &adc_chars);
 #else
   // ESP-IDF 5.x has analogReadMilliVolts
-  const uint16_t mv = analogReadMilliVolts(_adcPin);
+  // OnePage only: pause charging around the read. Other boards with a
+  // chargeEnable pin (e.g. Sticky) must NOT have it glitched during battery reads.
+  uint16_t mv = 0;
+  if (BoardConfig::isOnePage() && BoardConfig::ACTIVE.power.chargeEnable >= 0) {
+    const int8_t ce = BoardConfig::ACTIVE.power.chargeEnable;
+    const bool activeHigh = BoardConfig::ACTIVE.power.chargeEnableActiveHigh;
+    pinMode(ce, OUTPUT);
+    digitalWrite(ce, activeHigh ? LOW : HIGH);  // pause charging
+    delay(5);
+    mv = analogReadMilliVolts(_adcPin);
+    digitalWrite(ce, activeHigh ? HIGH : LOW);  // resume charging
+  } else {
+    mv = analogReadMilliVolts(_adcPin);
+  }
 #endif
 
   return static_cast<uint16_t>(mv * _dividerMultiplier);
@@ -453,11 +483,15 @@ bool BatteryMonitor::isCharging() const {
 #if FREEINK_BATTERY_I2C_GAUGE
   // Gauge boards: prefer a charger IC's status (BQ25896), else fall back to the
   // gauge's own Current() sign, so a board with a gauge but no charger IC (e.g.
-  // X3) still reports charging. Unknown/failed reads report false.
+  // X3) still reports charging. A gauge that cannot observe charging at all
+  // (CW2017) reports unknown — fall through to the STAT pin below (X4 Pro
+  // GPIO21). Failed reads report false.
   if (BoardConfig::ACTIVE.batteryGauge.gaugeAddr != 0) {
     bool known = false;
     const bool charging = readGaugeCharging(known);
-    return known && charging;
+    if (known) {
+      return charging;
+    }
   }
 #endif
   if (hasM5Pm1Backend()) {
@@ -467,8 +501,9 @@ bool BatteryMonitor::isCharging() const {
   if (_chargeStatusPin < 0) {
     return false;
   }
-  // MCP73832-style /STAT: LOW while charging.
-  return digitalRead(_chargeStatusPin) == LOW;
+  // STAT at its board-declared active level (default: MCP73832-style /STAT,
+  // LOW while charging).
+  return digitalRead(_chargeStatusPin) == chargeActiveLevel();
 }
 
 bool BatteryMonitor::readM5Pm1Status(Status& status) const {

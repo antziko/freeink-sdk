@@ -208,6 +208,9 @@ It manages a remaining content rectangle from `safeRect()`:
 - `status(props)` consumes the top status band
 - `footer(actions, count)` consumes the bottom footer band
 - `footer(props)` accepts `FooterProps` for nav spacing and button border edges
+- `setContentMargin(insets)` reserves space relative to the device safe area;
+  `setContentMarginFromScreen(insets)` reserves physical screen-edge chrome
+  without applying the safe-area insets twice
 - `button(label, action, value, state)` adds one full-width row button
 - `list(items, count, selected, action, topIndex)` fills the remaining body
 - `list(props)` uses a full `ListProps` when you need detailed styling
@@ -800,13 +803,22 @@ keyboard.okAction = ActionKeyboardOk;
 freeink::ui::keyboard(ui, keyboardRect, keyboard);
 ```
 
-Built-in layout IDs are `QwertyEn`, `AzertyFr`, `QwertzDe`, and `SpanishEs`.
+Built-in layout IDs are `QwertyEn`, `AzertyFr`, `QwertzDe`, `SpanishEs`,
+`CyrillicRu`, `CyrillicUk`, `CyrillicBe`, `CyrillicKk`, and `HebrewIl`.
 Normal ASCII keys report their code point in `ActionEvent::value`; localized
 keys use stable non-ASCII values so firmware can map the selected key back to
 the active layout's UTF-8 output string. Visible glyph coverage depends on the
 active `DrawTarget` font asset, so devices shipping wider language support
 should include matching Noto Sans glyph ranges in their generated bitmap font or
 use a renderer with native text shaping.
+
+An app that reaches more than one script sets `builtinKeyboardLayout`'s
+`langKey` flag and a `KeyboardProps::langAction`, which puts a script-switch key
+in the bottom row. It draws a globe and takes no label of its own: which layout
+is active is already visible in the letter keys. The flag is off by default and
+the Latin layouts respect it, so a single-script keyboard renders without the
+key; the non-Latin layouts carry it either way, since a keyboard with no Latin
+letters cannot type a Wi-Fi password or a URL.
 
 Reader screens can register invisible tap zones over the page while drawing
 chrome separately:
@@ -964,6 +976,26 @@ freeink::ui::list(ui, rect, props);
 `listTopIndexFor` scrolls the window the minimal amount to keep the selection
 visible and clamps to the valid range, so GPIO up/down navigation gets correct
 scrolling for free.
+
+Rows are not all the same height: a wrapped label or subtitle grows one, so a
+layout routinely fits fewer indexes than `listVisibleRows()` estimates. Screens
+that scroll (swipe or button navigation) should therefore own a `ListNav` and
+call `nav.syncToProps(body, rowHeight, rowGap, count, props)` right before
+`list()`. `list()` reports the viewport it actually laid out back through
+`props.nav`, which gives the nav the real page size (`pageRows()`, the delta to
+page by) and lets it keep a clipped tail reachable. Because that feedback
+arrives only after a layout, a nav-managed screen must render in a small loop:
+
+```cpp
+for (int pass = 0; pass < 8; ++pass) {
+  app.render();
+  if (!nav.consumeRebuildNeeded()) break;
+}
+```
+
+Without the loop a clipped list can paint one frame with the selection or the
+scroll indicator missing. Callers repaint each pass over the previous one, so
+`list()` keeps the row geometry stable across the passes of a single render.
 
 ### Dialogs
 
