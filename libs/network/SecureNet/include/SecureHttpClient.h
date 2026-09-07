@@ -241,6 +241,10 @@ class SecureHttpClient {
         if (line.empty()) break;  // end of headers
         const size_t colon = line.find(':');
         if (colon == std::string::npos) continue;
+        // substr allocates through the throwing operator new too, and `line` may be several
+        // KB. Probing the whole line covers both pieces; skipping the header degrades to
+        // "not seen", which the framing below already handles, instead of aborting.
+        if (!canCopy(line)) continue;
         std::string name = line.substr(0, colon);
         std::string value = line.substr(colon + 1);
         while (!value.empty() && value.front() == ' ') value.erase(value.begin());
@@ -409,8 +413,44 @@ class SecureHttpClient {
   // connection are consumed inline by the parse loop and never read back from this table.
   // Only getHeader() lookups (in this firmware, "location") can miss, and a missed Location
   // fails the redirect with an error rather than a panic.
+  // True when `s` can take one more character. Probes the next capacity libstdc++ would ask
+  // for rather than the single byte, since that is the allocation that actually happens.
+  static bool canGrow(const std::string& s) {
+    const size_t next = s.capacity() < 16 ? 16 : s.capacity() * 2;
+    void* probe = ::operator new(next, std::nothrow);
+    if (probe == nullptr) return false;
+    ::operator delete(probe, std::nothrow);
+    return true;
+  }
+
+  // True when a copy of `s` can be allocated right now. A string short enough to live in its
+  // own SSO buffer never reaches the heap, so it always can.
+  static bool canCopy(const std::string& s) {
+    if (s.size() < 16) return true;  // libstdc++ SSO: no allocation
+    void* probe = ::operator new(s.size() + 1, std::nothrow);
+    if (probe == nullptr) return false;
+    ::operator delete(probe, std::nothrow);
+    return true;
+  }
+
+  // Probe before the copy, for the same reason reserveHeaderTable() probes before reserve():
+  // Header{name, value} copies both strings through the THROWING operator new, so a heap too
+  // tight for the copy aborts the device instead of failing the request. reserveHeaderTable()
+  // bounded how MANY headers are kept; nothing bounded how LARGE one may be, and a response
+  // header can be arbitrarily large up to MAX_LINE — github's release-asset redirect carries a
+  // ~3.5 KB content-security-policy. An X3 capture (09-07) panicked in exactly this copy on the
+  // first font-file GET: 3,601 bytes wanted against a 2,676-byte largest block, with the
+  // handshake holding the rest.
+  //
+  // Skipping an unaffordable header is safe for every consumer: content-length,
+  // transfer-encoding and connection are all parsed from the caller's own `value` before this
+  // is reached, so framing and keep-alive are untouched, and the only reader of the stored
+  // table is getHeader("location"). A Location is orders of magnitude smaller than the headers
+  // this drops, so a redirect that the heap can follow at all still resolves. When memory is
+  // available — every case on a healthy heap — the probe succeeds and behaviour is unchanged.
   void storeHeader(const std::string& name, const std::string& value) {
     if (_responseHeaders.size() >= _responseHeaders.capacity()) return;
+    if (!canCopy(name) || !canCopy(value)) return;
     _responseHeaders.push_back(Header{name, value});
   }
 
@@ -536,6 +576,7 @@ class SecureHttpClient {
   // closed connection with no pending data, or an over-long line.
   bool readLine(Client& c, std::string& line, unsigned long deadline, const AbortCallback& shouldAbort = nullptr) {
     line.clear();
+    bool truncated = false;
     while (static_cast<int32_t>(millis() - deadline) < 0) {
       if (isAborted(shouldAbort)) return false;
       while (c.available() > 0) {
@@ -546,7 +587,14 @@ class SecureHttpClient {
           return true;
         }
         if (line.size() >= MAX_LINE) return false;
-        line += static_cast<char>(ch);
+        // A header line grows through the THROWING operator new, so on a tight heap the
+        // append itself aborts the device — an X3 capture (09-07) panicked here wanting
+        // 3,841 bytes against a 3,828-byte largest block, reading github's ~3.5 KB
+        // content-security-policy. Once the heap cannot carry the line any further, consume
+        // the rest of it and drop the tail rather than dying: an oversized header is one this
+        // client does not read, and the framing headers are short and arrive first.
+        if (!truncated && line.size() + 1 > line.capacity() && !canGrow(line)) truncated = true;
+        if (!truncated) line += static_cast<char>(ch);
       }
       if (!c.connected() && c.available() == 0) return false;
       delay(1);
