@@ -303,9 +303,13 @@ bool Uc8279X4Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
       bus.cmd(CMD_DTM1);
       for (uint16_t y = 0; y < _tresH; y++) bus.data(whiteRow, wb);
     }
-  } else if (_redriveAfterGray) {
-    // Re-drive every pixel once after grayscale so the B/W transition scrubs
-    // residual edge charge before restoring the ordinary differential baseline.
+  } else if (_redriveAfterGray || _darkBackground) {
+    // OLD = ~target, so every pixel transitions on the cheap DU (no GC flash).
+    // After grayscale: scrubs the gray edge charge the B/W baseline can't see.
+    // Under inverted output: re-blackens the static background, where the light
+    // residue of every white->black transition parks and would otherwise
+    // accumulate into a halo around the text -- a plain differential never
+    // drives an unchanged pixel again.
     streamPlane(bus, CMD_DTM1, fb, /*invert=*/true);
   }
   // Consumed: the white-seed (!fast) or the re-drive above already scrubbed any

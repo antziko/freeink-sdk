@@ -80,6 +80,13 @@ class Uc8279X4Driver : public PanelDriver {
   void requestResync(uint8_t settlePasses) override;
   void skipInitialResync() override;
 
+  // Night mode. Inverted output leaves the black background as the resting
+  // state of every unchanged pixel, and a plain differential never drives it
+  // again -- so the light residue each white->black transition parks there
+  // accumulates as a halo around the text. Honouring the hint re-drives every
+  // pixel on each fast refresh (see _redriveAfterGray, same mechanism).
+  void setBackgroundHint(bool darkBackground) override { _darkBackground = darkBackground; }
+
   // --- 4-level grayscale (anti-aliasing) ---
   // External-LUT path (ported from the UC8179 sibling). CrossPoint supplies DELTA
   // masks (maskLsb, maskMsb): black/white=(0,0), dark=(1,1), light=(0,1), with a
@@ -151,6 +158,12 @@ class Uc8279X4Driver : public PanelDriver {
   // by the next B/W displayStart to RE-DRIVE every pixel to its target (DTM1 =
   // ~newframe), scrubbing the residue with a cheap DU (no GC flash).
   bool _redriveAfterGray = false;
+  // Inverted (night-mode) output: re-drive every pixel on EVERY fast refresh,
+  // not just after grayscale. The drive is optically invisible on a pixel
+  // already at its target, and it re-blackens the background the residue parks
+  // on. The DU waveform length is fixed, so the only cost is the one extra
+  // OLD-plane stream displayStart makes on the fast path.
+  bool _darkBackground = false;
 
   // Async split state (see Uc8179Driver for the contract).
   bool _pendingRefresh = false;
