@@ -127,6 +127,11 @@ class FrontlightManager {
 #endif
   uint8_t _brightness = 0;
   uint8_t _brightnessLevel = 0;
+  // Duty resolution the LEDC timer actually accepted, which is not always the
+  // board's requested pwmResolutionBits: the light-sleep clock (RC_FAST) cannot
+  // always carry freq x 2^bits, so begin() negotiates it down. apply() must
+  // scale against this, not the profile value.
+  uint8_t _dutyBits = 0;
   bool _useLevel = false;
   uint8_t _lastBrightness = 50;
   uint8_t _warmPercent = 50;  // neutral by default
