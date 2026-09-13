@@ -368,8 +368,8 @@ void Ssd1677Driver::powerOn(EpdBus& bus) {
   _isScreenOn = true;
 }
 
-void Ssd1677Driver::powerOffController(EpdBus& bus) {
-  if (!_isScreenOn) return;
+void Ssd1677Driver::powerOffController(EpdBus& bus, const bool force) {
+  if (!_isScreenOn && !force) return;
   bus.cmd(CMD_BORDER_WAVEFORM);
   bus.data(_cfg.borderWaveformInit);  // X4 Pro: 0x80
   bus.cmd(CMD_DISPLAY_UPDATE_CTRL2);
@@ -649,7 +649,17 @@ void Ssd1677Driver::deepSleep(EpdBus& bus) {
   // Stock parity (_powerOff): park the border at its init value so it is not left
   // driven with the full-refresh waveform through deep sleep, then power down
   // analog/clock. Stock does not touch CTRL1 here.
-  powerOffController(bus);
+  //
+  // Forced, because _isScreenOn is not a reliable picture of the rails here: the
+  // custom-LUT (grayscale) activation 0xCC carries no power-off bits, yet that path
+  // marks the flag off for vendor parity (refresh(), _customLutActive branch). A
+  // grayscale frame as the last thing before deep sleep -- which is exactly a
+  // grayscale sleep wallpaper -- would then skip this entirely and enter deep sleep
+  // with analog/clock up and the border still driven at borderWaveformGray. The
+  // documented sequence is harmless when the rails are already down (the UC8279
+  // sibling issues its POF the same way), and it costs one ~200ms activation per
+  // sleep.
+  powerOffController(bus, /*force=*/true);
   // Stock parity: deep sleep mode 2 (0x03) discards controller RAM. Nothing may
   // treat RAM as a valid diff baseline after wake — initController() re-arms
   // _needsInitialFull, so the first paint is an absolute clean anyway.

@@ -106,8 +106,10 @@ class Ssd1677Driver : public PanelDriver {
   // Blocking CLOCK_ON|ANALOG_ON activation; no-op when already powered.
   void powerOn(EpdBus& bus);
   // Documented SSD1677 analog/oscillator shutdown. Used after a 0xFC update
-  // when turnOff was requested and by deepSleep().
-  void powerOffController(EpdBus& bus);
+  // when turnOff was requested and by deepSleep(). `force` runs the sequence even
+  // when _isScreenOn says the rails are already down -- see deepSleep(), where that
+  // flag cannot be trusted after a custom-LUT pass.
+  void powerOffController(EpdBus& bus, bool force = false);
   void displayImpl(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff, bool async);
 
   const Ssd1677Config& _cfg;
