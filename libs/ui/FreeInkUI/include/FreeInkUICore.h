@@ -1102,6 +1102,19 @@ public:
     return routeAgainst(published_.load(std::memory_order_acquire), input);
   }
 
+  // The published interaction a point falls in, or nullptr. Same table and same
+  // hit rule routePublished() uses, so a caller that wants to draw on the element
+  // a touch landed on BEFORE the dispatch (touch acknowledgment on an element that
+  // navigates away and so never repaints) can never mark a different element than
+  // the one that acts. Rect is the hit rect, which ensureMinTouchRect may have
+  // grown past the element's visual bounds.
+  const Interaction *publishedHitAt(const int16_t x, const int16_t y,
+                                    const InputMask kind = InputTouch) const {
+    const uint8_t slot = published_.load(std::memory_order_acquire);
+    const int16_t idx = findTouch(slot, x, y, kind);
+    return idx < 0 ? nullptr : &interactions_[slot][idx];
+  }
+
   // Opts a render pass into cross-task double buffering: subsequent
   // clear()/addInteraction()/route()/etc. build into whichever generation is
   // NOT currently published, so a concurrent routePublished()/publishedData()

@@ -869,6 +869,16 @@ public:
   // it active and it renders with its StateActive style).
   bool touchActive() const { return interactions_.activeIndex() >= 0; }
 
+  // The interaction a touch point falls in, against the last published table —
+  // the one route() itself hit-tests. For a caller that must draw on the element
+  // a tap landed on before routing dispatches it (an element whose handler leaves
+  // the screen never gets the tap-flash repaint). nullptr when the point hits
+  // nothing.
+  const Interaction *publishedHitAt(const int16_t x, const int16_t y,
+                                    const InputMask kind = InputTouch) const {
+    return interactions_.publishedHitAt(x, y, kind);
+  }
+
   // Drop a pending tap flash. Call from handlers that navigate to a different
   // screen: the tapped element no longer exists there, and an element on the
   // NEW screen with the same action/value would inherit the gray instead
