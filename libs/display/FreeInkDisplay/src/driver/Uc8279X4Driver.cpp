@@ -8,6 +8,8 @@
 
 #include <BoardConfig.h>
 
+#include "../lut/Uc8279X3Luts.h"
+
 // Orientation of the visible-row stream, switchable per build for field A/B.
 // Defaults (0/0) = the stock convention, HARDWARE-CONFIRMED upright on a field
 // UC8279 unit: rows forward, no byte/bit mirroring — orientation comes from the
@@ -90,6 +92,122 @@ const GrayLut* selectAaLuts() {
   // are identical.
   return BoardConfig::ACTIVE.displayControllerVariant == 0x02 ? kXtfAa02 : kXtfAa68;
 }
+
+// Four-tone image quality bank, built at first use by time-scaling the X3
+// XTH4 four-grey waveform (ported from the inx-pro downstream, which ships
+// this for its UC8279 sleep/comic images; HARDWARE-VALIDATED on an X4C).
+// Phase durations are scaled to FREEINK_UC8279X4_GRAY_SPEED percent, then
+// repaired: net charge per table is restored to zero (a naive timing cut
+// breaks DC balance) and all tables are padded to equal total frame count.
+// The bank consumes the ordinary inverted fold planes and is uploaded with
+// the 0x22/0x23 registers EXCHANGED (their empirically found plane-code
+// assignment for this panel).
+#ifndef FREEINK_UC8279X4_GRAY_SPEED
+#define FREEINK_UC8279X4_GRAY_SPEED 60
+#endif
+const uint8_t (*scaledQualityBank())[GRAY_LUT_LEN] {
+  static uint8_t out[5][GRAY_LUT_LEN];
+  static bool built = false;
+  if (built) return out;
+
+  constexpr uint8_t kGroups = 7;
+  constexpr uint8_t kPhases = 4;
+  struct Phase {
+    uint8_t rail;
+    uint8_t frames;
+  };
+  Phase ph[5][kGroups][kPhases] = {};
+  uint8_t used[5] = {};
+
+  auto netCharge = [&](uint8_t t) {
+    int n = 0;
+    for (uint8_t g = 0; g < used[t]; g++)
+      for (uint8_t i = 0; i < kPhases; i++) {
+        if (ph[t][g][i].rail == 1) n += ph[t][g][i].frames;
+        else if (ph[t][g][i].rail == 2) n -= ph[t][g][i].frames;
+      }
+    return n;
+  };
+  auto totalFrames = [&](uint8_t t) {
+    int total = 0;
+    for (uint8_t g = 0; g < used[t]; g++)
+      for (uint8_t i = 0; i < kPhases; i++) total += ph[t][g][i].frames;
+    return total;
+  };
+
+  for (uint8_t t = 0; t < 5; t++) {
+    const uint8_t* src = kUc8279X3_Xth4[t];
+    uint8_t g = 0;
+    for (; g < kGroups; g++) {
+      const uint8_t* grp = src + g * 7;
+      bool empty = true;
+      for (uint8_t i = 0; i < kPhases; i++)
+        if (grp[1 + i] != 0) empty = false;
+      if (empty) break;
+      for (uint8_t i = 0; i < kPhases; i++) {
+        const uint8_t b = grp[1 + i];
+        const uint8_t frames = static_cast<uint8_t>(b & 0x3F);
+        uint16_t scaled = (static_cast<uint16_t>(frames) * FREEINK_UC8279X4_GRAY_SPEED + 50u) / 100u;
+        if (frames != 0 && scaled == 0) scaled = 1;
+        if (scaled > 63) scaled = 63;
+        ph[t][g][i] = {static_cast<uint8_t>(b >> 6), static_cast<uint8_t>(scaled)};
+      }
+    }
+    used[t] = g;
+
+    // Restore DC balance: nudge the largest opposing-rail phase until the
+    // VSH/VSL frame counts cancel again.
+    int n = netCharge(t);
+    while (n != 0) {
+      const uint8_t want = n > 0 ? 2 : 1;
+      uint8_t bg = 0xFF, bi = 0, best = 0;
+      for (uint8_t g2 = 0; g2 < used[t]; g2++)
+        for (uint8_t i = 0; i < kPhases; i++)
+          if (ph[t][g2][i].rail == want && ph[t][g2][i].frames > best && ph[t][g2][i].frames < 63) {
+            best = ph[t][g2][i].frames;
+            bg = g2;
+            bi = i;
+          }
+      if (bg == 0xFF) break;
+      ph[t][bg][bi].frames++;
+      n = netCharge(t);
+    }
+  }
+
+  // Equalize table lengths with idle (VSS) padding groups so all five LUTs
+  // finish on the same frame.
+  int longest = 0;
+  for (uint8_t t = 0; t < 5; t++)
+    if (totalFrames(t) > longest) longest = totalFrames(t);
+  for (uint8_t t = 0; t < 5; t++) {
+    int deficit = longest - totalFrames(t);
+    while (deficit > 0 && used[t] < kGroups - 1) {
+      const uint8_t chunk = static_cast<uint8_t>(deficit > 63 ? 63 : deficit);
+      ph[t][used[t]][0] = {0, chunk};
+      used[t]++;
+      deficit -= chunk;
+    }
+  }
+
+  memset(out, 0, sizeof(out));
+  for (uint8_t t = 0; t < 5; t++) {
+    for (uint8_t g = 0; g < used[t]; g++) {
+      uint8_t* dst = out[t] + g * 7;
+      dst[0] = 0x01;
+      for (uint8_t i = 0; i < kPhases; i++)
+        dst[1 + i] = static_cast<uint8_t>((ph[t][g][i].rail << 6) | (ph[t][g][i].frames & 0x3F));
+      dst[5] = 0x01;
+      dst[6] = 0x01;
+    }
+  }
+
+  built = true;
+  return out;
+}
+
+// Register order for the quality bank: 0x22 and 0x23 exchanged relative to
+// table order (inx-pro's empirically found assignment for this panel).
+constexpr uint8_t kQualityLutReg[5] = {0x20, 0x21, 0x23, 0x22, 0x24};
 
 }  // namespace
 
@@ -198,9 +316,12 @@ void Uc8279X4Driver::streamPlane(EpdBus& bus, uint8_t ramCmd, const uint8_t* fb,
   uint8_t row[128];
   const uint16_t wb = _wb <= sizeof(row) ? _wb : sizeof(row);
   bus.cmd(ramCmd);
+  // The OEM driver keeps CS asserted across a plane upload. Preserve our validated
+  // gate offset/orientation, but avoid a new SPI transaction for every row.
+  bus.beginTxn();
   // Gates before the visible window (the 120-gate offset): white.
   memset(row, 0xFF, wb);
-  for (uint16_t y = 0; y < _cfg.gateOffset; y++) bus.data(row, wb);
+  for (uint16_t y = 0; y < _cfg.gateOffset; y++) bus.rawWriteBytes(row, wb);
   // Visible rows, stock convention (hardware-confirmed upright): forward order,
   // bytes as-is. The ROWREV/XMIRROR switches (row reversal / reversed byte order
   // + reversed bits) exist for future panel sub-variants whose scan differs.
@@ -220,11 +341,12 @@ void Uc8279X4Driver::streamPlane(EpdBus& bus, uint8_t ramCmd, const uint8_t* fb,
       }
       row[i] = invert ? static_cast<uint8_t>(~b) : b;
     }
-    bus.data(row, wb);
+    bus.rawWriteBytes(row, wb);
   }
   // Gates after the visible window: white, up to the addressed gate count.
   memset(row, 0xFF, wb);
-  for (uint16_t y = _cfg.gateOffset + _h; y < _tresH; y++) bus.data(row, wb);
+  for (uint16_t y = _cfg.gateOffset + _h; y < _tresH; y++) bus.rawWriteBytes(row, wb);
+  bus.endTxn();
 }
 
 // Same geometry/mirroring as streamPlane, but each visible byte is lhs ^ rhs.
@@ -232,8 +354,9 @@ void Uc8279X4Driver::streamPlaneXor(EpdBus& bus, uint8_t ramCmd, const uint8_t* 
   uint8_t row[128];
   const uint16_t wb = _wb <= sizeof(row) ? _wb : sizeof(row);
   bus.cmd(ramCmd);
+  bus.beginTxn();
   memset(row, 0xFF, wb);
-  for (uint16_t y = 0; y < _cfg.gateOffset; y++) bus.data(row, wb);
+  for (uint16_t y = 0; y < _cfg.gateOffset; y++) bus.rawWriteBytes(row, wb);
   static const uint8_t kBitRev[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
                                       0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
   for (uint16_t n = 0; n < _h; n++) {
@@ -250,10 +373,11 @@ void Uc8279X4Driver::streamPlaneXor(EpdBus& bus, uint8_t ramCmd, const uint8_t* 
       }
       row[i] = invert ? static_cast<uint8_t>(~b) : b;
     }
-    bus.data(row, wb);
+    bus.rawWriteBytes(row, wb);
   }
   memset(row, 0xFF, wb);
-  for (uint16_t y = _cfg.gateOffset + _h; y < _tresH; y++) bus.data(row, wb);
+  for (uint16_t y = _cfg.gateOffset + _h; y < _tresH; y++) bus.rawWriteBytes(row, wb);
+  bus.endTxn();
 }
 
 void Uc8279X4Driver::powerOnIfNeeded(EpdBus& bus, const char* tag) {
@@ -264,6 +388,7 @@ void Uc8279X4Driver::powerOnIfNeeded(EpdBus& bus, const char* tag) {
 }
 
 bool Uc8279X4Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
+  _absoluteInput = false;
   (void)prev;
   // Snapshot the B/W base for a grayscale overlay that may follow (the reader
   // draws this base, then folds it into the absolute AA planes). Harmless for
@@ -297,11 +422,7 @@ bool Uc8279X4Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
     } else {
       // Full flash: seed the OLD plane white across the whole 600-gate scan for
       // the absolute GC-from-white waveform.
-      uint8_t whiteRow[128];
-      const uint16_t wb = _wb <= sizeof(whiteRow) ? _wb : sizeof(whiteRow);
-      memset(whiteRow, 0xFF, wb);
-      bus.cmd(CMD_DTM1);
-      for (uint16_t y = 0; y < _tresH; y++) bus.data(whiteRow, wb);
+      bus.fillPlane(CMD_DTM1, 0xFF, _tresH, _wb);
     }
   } else if (_redriveAfterGray || _darkBackground) {
     // OLD = ~target, so every pixel transitions on the cheap DU (no GC flash).
@@ -393,6 +514,7 @@ void Uc8279X4Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
 }
 
 void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
+  _absoluteInput = false;
   (void)settlePasses;
   _needFullClear = true;
 }
@@ -400,6 +522,7 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
 void Uc8279X4Driver::skipInitialResync() { _needFullClear = false; }
 
 void Uc8279X4Driver::deepSleep(EpdBus& bus) {
+  _absoluteInput = false;
   if (_isScreenOn) {
     bus.cmd(CMD_POWER_OFF);
     bus.waitBusy(" 8279x4 power-down");
@@ -415,8 +538,19 @@ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
 // black=(0,0) and white=(1,1) are distinct buckets (the earlier raw-delta path
 // conflated them → white-text ghosting). plane0/LSB -> DTM1 (0x10),
 // plane1/MSB -> DTM2 (0x13).
+void Uc8279X4Driver::beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback, bool turnOff) {
+  _absoluteInput = false;
+  displayGrayscaleBase(bus, fb, fallback, turnOff);
+  _absoluteInput = mode == GrayscaleMode::Absolute;
+}
+
 void Uc8279X4Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
   if (!lsb) return;
+  if (_absoluteInput) {
+    bus.waitBusy(" absolute plane");
+    streamPlane(bus, CMD_DTM1, lsb, true);
+    return;
+  }
   _absoluteGrayPlanes = false;
   if (_grayBaseValid && _grayBase != nullptr) {
     // plane0 = base | maskLsb  (base bit = 1 for white, 0 for non-white).
@@ -429,8 +563,30 @@ void Uc8279X4Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
   _grayBaseValid = false;  // _grayBase now holds absolute plane0, not the B/W base
 }
 
+// Grey-mask coverage (percent of panel pixels) above which a gray pass is
+// treated as an image and refreshed with the scaled four-tone quality bank.
+// Deliberately high: only image-DOMINANT surfaces (sleep screens, standalone
+// image pages, full covers — typically 30%+) should cross it. Glyph AA marks
+// 1-2%; book pages with modest inline images stay under it and keep stock AA.
+#ifndef FREEINK_UC8279X4_QUALITY_COVERAGE_PCT
+#define FREEINK_UC8279X4_QUALITY_COVERAGE_PCT 25
+#endif
+
 void Uc8279X4Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
   if (!msb) return;
+  if (_absoluteInput) {
+    bus.waitBusy(" absolute plane");
+    streamPlane(bus, CMD_DTM2, msb, true);
+    return;
+  }
+  // The MSB mask marks every grey pixel (dark=(1,1), light=(0,1)); its
+  // coverage separates image passes from glyph anti-aliasing without a
+  // caller-side hint (see displayGray).
+  {
+    uint32_t grayPx = 0;
+    for (uint32_t i = 0; i < _bufferSize; i++) grayPx += __builtin_popcount(msb[i]);
+    _grayImagePass = grayPx * 100u > _bufferSize * 8u * FREEINK_UC8279X4_QUALITY_COVERAGE_PCT;
+  }
   if (_absoluteGrayPlanes && _grayBase != nullptr) {
     // plane1 = plane0 ^ maskMsb (streamed inverted). Then recover the B/W base
     // for the post-DRF restore: base = plane0 & plane1 = plane0 & (plane0 ^ msb).
@@ -445,8 +601,7 @@ void Uc8279X4Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
 
 void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut,
                                  bool factoryMode) {
-  (void)lut;          // waveform is the variant-selected built-in xtfAa table set
-  (void)factoryMode;  // 4-level is absolute (defined by the planes)
+  (void)lut;  // waveform is a built-in bank (scaled quality or stock xtfAa)
 
   // Vendor AA sequence: PSR (REG=1) -> [planes already in RAM via
   // copyGrayscale*] -> 5x49 LUTs -> CDI (constant 0x97) -> PON -> PSR rewrite ->
@@ -454,11 +609,25 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
   bus.cmd(CMD_PANEL_SETTING);
   bus.data(_cfg.psr0);  // 0x33: REG=1, external LUT
   bus.data(_cfg.psr1);
-  const GrayLut* luts = selectAaLuts();
-  for (int i = 0; i < 5; i++) {
-    bus.cmd(luts[i].cmd);
-    bus.data(luts[i].data, GRAY_LUT_LEN);
+  // Bank selection: glyph anti-aliasing keeps the stock three-tone xtfAa set
+  // (one mid grey is the whole job there; a longer four-grey waveform on every
+  // book page reads as constant heavy refreshes). A pass whose grey-mask
+  // coverage crossed the image threshold (see copyGrayscaleMsb), or an
+  // explicit factoryMode request, runs the scaled four-tone quality bank.
+  if (factoryMode || _grayImagePass) {
+    const uint8_t(*bank)[GRAY_LUT_LEN] = scaledQualityBank();
+    for (int i = 0; i < 5; i++) {
+      bus.cmd(kQualityLutReg[i]);
+      bus.data(bank[i], GRAY_LUT_LEN);
+    }
+  } else {
+    const GrayLut* luts = selectAaLuts();
+    for (int i = 0; i < 5; i++) {
+      bus.cmd(luts[i].cmd);
+      bus.data(luts[i].data, GRAY_LUT_LEN);
+    }
   }
+  _grayImagePass = false;
   bus.cmd(CMD_VCOM_DATA_INTERVAL);
   bus.data(_cfg.cdiAa);  // constant 0x97 every AA refresh (stock; no first/later split)
   _grayRefreshedOnce = true;
@@ -501,15 +670,16 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
   // displayStart), scrubbing residue with a cheap DU — an explicit Half GC
   // remains the strong purge.
   _redriveAfterGray = true;
+  _absoluteInput = false;
 }
 
 void Uc8279X4Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) {
   if (!fb) return;
-  // Match the UC8179 sibling: an explicit Half (the periodic ghost purge), or a
+  // Match the UC8179 sibling: an explicit Full/Half clean, or a
   // state that can't run the non-flashing transition (first AA page / no valid
   // previous / pending full clear), takes a real B/W activation via display().
   // Otherwise use stock's non-flashing prev->current transition.
-  if (fallback == RefreshMode::Half || !_grayRefreshedOnce || !_oldPlaneValid || _needFullClear) {
+  if (fallback != RefreshMode::Fast || !_grayRefreshedOnce || !_oldPlaneValid || _needFullClear) {
     display(bus, fb, nullptr, fallback, turnOff);
     return;
   }
@@ -592,6 +762,7 @@ void Uc8279X4Driver::runGrayscalePrecondition(EpdBus& bus) {
 }
 
 void Uc8279X4Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
+  _absoluteInput = false;
   _grayBaseValid = false;
   _absoluteGrayPlanes = false;
   if (!bw) {
@@ -604,7 +775,7 @@ void Uc8279X4Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
   // to both planes; this covers callers that reach cleanup by another route.)
   streamPlane(bus, CMD_DTM1, bw);
   _oldPlaneValid = true;
-  _needFullClear = false;
+  // RAM restoration does not cancel a requested physical clean.
 }
 
 // Per-board config injection, same idiom as the other drivers: define
