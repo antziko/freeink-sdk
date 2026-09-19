@@ -521,6 +521,27 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
 
 void Uc8279X4Driver::skipInitialResync() { _needFullClear = false; }
 
+// Park the analog domain whenever the panel has nothing queued.
+//
+// powerOnIfNeeded() is `if (_isScreenOn) return`, and POF is otherwise issued only for an
+// explicit turnOff (displayFinish) or at deepSleep. So without this the DC-DC stays energised
+// from the first paint after boot until the device sleeps -- a whole reading session of rails
+// standing across one static image, which is the DC stress that sets image retention. The
+// vendor sequence powers down after every refresh for exactly this reason.
+//
+// POF only, never DSLP: the controller's logic and RAM stay up, so the OLD plane (DTM1) that
+// the next differential pass diffs against survives, and the next activation just pays one PON
+// via powerOnIfNeeded(). Every activation path here already calls it -- displayStart (line 458),
+// displayGray (635) and runGrayscalePrecondition (758) -- and the turnOff=true configuration
+// drives this same POF/PON cycle around every single refresh, so an idle park is a strict
+// subset of a path the panel already runs.
+void Uc8279X4Driver::controllerIdle(EpdBus& bus) {
+  if (!_isScreenOn) return;
+  bus.cmd(CMD_POWER_OFF);
+  bus.waitBusy(" 8279x4_idle_POF");
+  _isScreenOn = false;
+}
+
 void Uc8279X4Driver::deepSleep(EpdBus& bus) {
   _absoluteInput = false;
   if (_isScreenOn) {
