@@ -258,8 +258,9 @@ public:
     list(props, height, anchor);
   }
 
-  void list(const ListProps &props, int16_t height = 0,
-            LayoutAnchor anchor = LayoutAnchor::Top) {
+  // Resolve once before navigation/window allocation, using the same policy
+  // as drawing. Explicit row heights remain caller-supplied minimums.
+  ListProps resolveListProps(const ListProps &props) {
     ListProps themed = props;
     if (!themed.textStylesExplicit) {
       if (textStyleUnset(themed.labelText))
@@ -298,10 +299,29 @@ public:
       }
       themed.rowStyles = styles;
     }
-    if (themed.rowHeight <= 0)
-      themed.rowHeight = theme_.rowHeight;
-    if (themed.rowGap < 0)
+    if (themed.rowHeight <= 0) {
+      if (themed.rowPaddingY < 0) {
+        const int16_t padding = device().hasTouch ? theme_.listTouchRowPaddingY : theme_.listRowPaddingY;
+        themed.rowPaddingY = padding < 0 ? 0 : padding;
+      }
+      themed.rowHeight = static_cast<int16_t>(target().lineHeight(themed.labelText.font) +
+                                              2 * themed.rowPaddingY);
+      if (themed.rowHeight < theme_.listMinRowHeight)
+        themed.rowHeight = theme_.listMinRowHeight;
+      if (device().hasTouch) {
+        const int16_t touchMin = device().minTouchSize > theme_.minTouchSize
+                                    ? device().minTouchSize : theme_.minTouchSize;
+        if (themed.rowHeight < touchMin)
+          themed.rowHeight = touchMin;
+        if (themed.rowHeight < theme_.listTouchMinRowHeight)
+          themed.rowHeight = theme_.listTouchMinRowHeight;
+      }
+    }
+    if (themed.rowGap < 0) {
       themed.rowGap = theme_.listRowGap;
+      if (device().hasTouch && themed.rowGap < theme_.listTouchRowGap)
+        themed.rowGap = theme_.listTouchRowGap;
+    }
     if (themed.rowRadius == 0)
       themed.rowRadius = theme_.listRowRadius;
     if (themed.sidePadding < 0)
@@ -316,6 +336,18 @@ public:
     // the band's true edge.
     if (themed.rowInset < 0)
       themed.rowInset = theme_.listInset;
+    return themed;
+  }
+
+  void syncListViewport(ListNav &nav, ListProps &props, const int count,
+                        const int selectionOffset = 0) {
+    props = resolveListProps(props);
+    nav.syncToProps(content_, props.rowHeight, props.rowGap, count, props, selectionOffset);
+  }
+
+  void list(const ListProps &props, int16_t height = 0,
+            LayoutAnchor anchor = LayoutAnchor::Top) {
+    const ListProps themed = resolveListProps(props);
     ui::list(frame_, height > 0 ? take(anchor, height) : content_, themed);
   }
 
@@ -626,12 +658,30 @@ public:
     ui::popup(frame_, centeredRect(bounds, panelSize), themed);
   }
 
+  // Theme substitution follows the slots optionDialog documents: a small
+  // caption, a prominent headline, a body line, and the option buttons. The
+  // measured height uses the SAME substituted styles as the draw, so a caller
+  // that leaves the styles to the theme gets a panel sized for the fonts it
+  // actually renders with.
   void dialog(const OptionDialogProps &props, int16_t width = 0) {
+    OptionDialogProps themed = props;
+    if (textStyleUnset(themed.titleText))
+      themed.titleText = theme_.smallText;
+    if (textStyleUnset(themed.headlineText))
+      themed.headlineText = theme_.titleText;
+    if (textStyleUnset(themed.messageText))
+      themed.messageText = theme_.bodyText;
+    if (textStyleUnset(themed.buttonText))
+      themed.buttonText = theme_.bodyText;
+    if (themed.styles.unset())
+      themed.styles = theme_.popup;
+    if (themed.buttonStyles.unset())
+      themed.buttonStyles = theme_.button;
     if (width <= 0)
       width = static_cast<int16_t>(frame_.safeRect().width * 4 / 5);
-    const int16_t height = optionDialogHeight(frame_.target(), props, width);
+    const int16_t height = optionDialogHeight(frame_.target(), themed, width);
     ui::optionDialog(
-        frame_, centeredRect(frame_.safeRect(), Size{width, height}), props);
+        frame_, centeredRect(frame_.safeRect(), Size{width, height}), themed);
   }
 
 private:

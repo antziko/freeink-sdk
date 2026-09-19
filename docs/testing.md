@@ -19,6 +19,23 @@ checks skip when those converters are unavailable. It builds layout tests for
 the default, SMALL, and LARGE memory profiles. Build outputs go under the system
 temporary directory.
 
+## Fonts
+
+```sh
+sh libs/font/FreeInkFont/test/host/run.sh
+sh libs/font/FreeInkFont/test/host/run_ligature.sh
+```
+
+Covers `FtFont::RenderOptions` (every `HintingMode` plus monochrome) against a
+real bundled font, plus a minimal build with none of the three
+`FREEINK_FONT_ENABLE_*` flags set to confirm existing consumers see no change
+in output and unsupported requests are reported rather than silently degraded.
+
+Covers `FtFont::ligature()`/`ligatureGlyphId()` (GSUB-based) against a real
+bundled font: exact-value assertions for the five standard Latin ligatures,
+the codepoint-vs-glyph-ID contract boundary, deinit()/re-init cache
+invalidation, and a null-pointer safety check on `Gsub::LigatureGlyphId`.
+
 ## Display drivers
 
 ```sh
