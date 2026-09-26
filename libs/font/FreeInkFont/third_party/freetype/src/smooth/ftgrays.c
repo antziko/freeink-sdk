@@ -468,6 +468,16 @@ typedef ptrdiff_t  FT_PtrDist;
 
   } TPixmap;
 
+  /* FreeInkFont: the pool below lives on the STACK of the rendering task
+   * (`gray_convert_glyph`), so it must fit an embedded FreeRTOS task stack.
+   * The cap lives here rather than only in ftoption.h because build systems
+   * cannot scan FreeType's `#include FT_CONFIG_OPTIONS_H` macro indirection,
+   * so ftoption.h edits do not invalidate compiled objects.  A smaller pool
+   * only makes the rasterizer subdivide into more bands; output is identical.
+   */
+#undef  FT_RENDER_POOL_SIZE
+#define FT_RENDER_POOL_SIZE  4096L
+
   /* maximum number of gray cells in the buffer */
 #if FT_RENDER_POOL_SIZE > 2048
 #define FT_MAX_GRAY_POOL  ( FT_RENDER_POOL_SIZE / sizeof ( TCell ) )

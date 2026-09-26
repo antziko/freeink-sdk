@@ -187,6 +187,11 @@
 
     FT_MEM_NEW_ARRAY( hash->table, sz );
 
+    /* On allocation failure leave the hash empty so that cleanup */
+    /* helpers do not walk a NULL table.                          */
+    if ( error )
+      hash->size = 0;
+
     return error;
   }
 
@@ -211,7 +216,7 @@
   ft_hash_str_free( FT_Hash    hash,
                     FT_Memory  memory )
   {
-    if ( hash )
+    if ( hash && hash->table )
     {
       FT_UInt       sz = hash->size;
       FT_Hashnode*  bp = hash->table;

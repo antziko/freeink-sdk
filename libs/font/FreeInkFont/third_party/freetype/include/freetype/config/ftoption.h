@@ -195,7 +195,12 @@ FT_BEGIN_HEADER
    *   Define this macro if you want to enable this 'feature'.  See also the
    *   macro `FT_CONFIG_OPTION_SYSTEM_ZLIB` below.
    */
+/* FreeInkFont: opt-in (FREEINK_FONT_ENABLE_GZIP). Only WOFF containers and
+ * gzip-compressed PCF fonts need it; a plain .ttf/.otf consumer skips the
+ * ~13KB gzip inflater (off also compiles the WOFF path out of sfnt). */
+#if FREEINK_FONT_ENABLE_GZIP
 #define FT_CONFIG_OPTION_USE_ZLIB
+#endif
 
 
   /**************************************************************************
@@ -331,7 +336,12 @@ FT_BEGIN_HEADER
    *   You would normally undefine this configuration macro when building a
    *   version of FreeType that doesn't contain a Type~1 or CFF driver.
    */
+/* FreeInkFont: opt-in (FREEINK_FONT_ENABLE_PSNAMES) together with the
+ * psnames module registration in ftmodule.h — this build ships no Type 1 or
+ * CFF driver, so the glyph-name machinery only serves FT_Get_Glyph_Name. */
+#if FREEINK_FONT_ENABLE_PSNAMES
 #define FT_CONFIG_OPTION_POSTSCRIPT_NAMES
+#endif
 
 
   /**************************************************************************
@@ -348,7 +358,10 @@ FT_BEGIN_HEADER
    *   in your 'psnames' module.  The Type~1 driver will not be able to
    *   synthesize a Unicode charmap out of the glyphs found in the fonts.
    */
+/* FreeInkFont: the AGL is the bulk of psnames' ~64KB; it goes with it. */
+#if FREEINK_FONT_ENABLE_PSNAMES
 #define FT_CONFIG_OPTION_ADOBE_GLYPH_LIST
+#endif
 
 
   /**************************************************************************
@@ -400,8 +413,13 @@ FT_BEGIN_HEADER
    *
    * The size in bytes of the render pool used by the scan-line converter to
    * do all of its work.
+   *
+   * FreeInkFont: the smooth rasterizer places this pool on the STACK
+   * (`gray_convert_glyph`), so it must fit within an embedded FreeRTOS task
+   * stack.  A smaller pool only makes the rasterizer subdivide into more
+   * bands; output is identical.
    */
-#define FT_RENDER_POOL_SIZE  16384L
+#define FT_RENDER_POOL_SIZE  4096L
 
 
   /**************************************************************************

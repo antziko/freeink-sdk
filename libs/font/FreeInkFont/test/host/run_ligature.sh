@@ -19,7 +19,7 @@ done
 
 # shellcheck disable=SC2086
 c++ -std=c++17 $INCLUDES $SANITIZERS \
-  "$FONT_ROOT/src/FtFont.cpp" "$FONT_ROOT/src/FontAlloc.c" "$FONT_ROOT/src/Gsub.cpp" \
+  "$FONT_ROOT/src/FtFont.cpp" "$FONT_ROOT/src/FontAlloc.c" "$FONT_ROOT/src/Gsub.cpp" "$FONT_ROOT/src/Gpos.cpp" \
   "$SCRIPT_DIR/FtFontLigatureTest.cpp" "$BUILD_DIR"/ft_*.o \
   -o "$BUILD_DIR/ftfont-ligature-test"
 "$BUILD_DIR/ftfont-ligature-test" "$FONT_FIXTURE"

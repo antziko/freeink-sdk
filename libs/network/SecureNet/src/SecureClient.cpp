@@ -142,6 +142,7 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   const uint32_t started = millis();
   stop();
   const uint32_t timeoutMs = getTimeout();
+  if (abortRequested()) return 0;
   _transport.setConnectionTimeout(timeoutMs);
   const uint32_t tcpStart = millis();
   if (!_transport.connect(host, port)) {
@@ -149,6 +150,10 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
     return 0;
   }
   _tcpMs = millis() - tcpStart;  // includes DNS: WiFiClient::connect resolves the name
+  if (abortRequested()) {
+    _transport.stop();
+    return 0;
+  }
 
   auto* ctx = wolfSSL_CTX_new(static_cast<WOLFSSL_METHOD*>(method));
   if (!ctx) {
@@ -216,6 +221,11 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
       failHandshake();
       return 0;
     }
+    if (abortRequested()) {
+      if (Serial) Serial.printf("[SecureClient] handshake aborted by caller (%s)\n", label);
+      stop();
+      return 0;
+    }
     if (static_cast<int32_t>(millis() - deadline) >= 0) {
       if (Serial) {
         Serial.printf("[SecureClient] handshake timeout (%s): last err %d, transport %s, free heap %u\n", label, err,
@@ -260,15 +270,23 @@ void SecureClient::failHandshake() {
   if (poisoned) dropSession();
 }
 
+bool SecureClient::abortRequested() {
+  if (!_shouldAbort || !_shouldAbort()) return false;
+  _aborted = true;
+  return true;
+}
+
 int SecureClient::connect(const char* host, uint16_t port) {
   // Per connect(), not per attempt: connectWithMethod runs twice below and the caller
   // reads one verdict.
   _lastHandshakeErr = 0;
+  _aborted = false;
   // Negotiate the highest mutually supported version rather than pinning TLS 1.3:
   // self-hosted / Let's Encrypt nginx often tops out at TLS 1.2, and a 1.3-only
   // client fails those handshakes outright. v23 still selects 1.3 when the peer
   // offers it (WOLFSSL_TLS13 is enabled) and falls back to 1.2 otherwise.
   if (connectWithMethod(host, port, wolfSSLv23_client_method(), "auto")) return 1;
+  if (_aborted) return 0;
 
   // Some TLS 1.2-only servers are intolerant of a TLS 1.3-capable ClientHello
   // and abort with a fatal handshake_failure alert. Retry with an explicit
