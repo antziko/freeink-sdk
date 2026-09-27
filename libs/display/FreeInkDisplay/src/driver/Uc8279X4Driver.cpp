@@ -447,13 +447,16 @@ bool Uc8279X4Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
       // the absolute GC-from-white waveform.
       bus.fillPlane(CMD_DTM1, 0xFF, _tresH, _wb);
     }
-  } else if (_redriveAfterGray || _darkBackground) {
-    // OLD = ~target, so every pixel transitions on the cheap DU (no GC flash).
-    // After grayscale: scrubs the gray edge charge the B/W baseline can't see.
-    // Under inverted output: re-blackens the static background, where the light
-    // residue of every white->black transition parks and would otherwise
-    // accumulate into a halo around the text -- a plain differential never
-    // drives an unchanged pixel again.
+  } else if (_redriveAfterGray) {
+    // One-shot after a grayscale pass: OLD = ~target, so every pixel transitions on
+    // the cheap DU (no GC flash) and the gray edge charge the B/W baseline cannot see
+    // is scrubbed. Deliberately NOT extended to inverted output on every fast refresh:
+    // that pulses each unchanged pixel in one direction forever (background always
+    // toward black, text always toward white), which is optically invisible per frame
+    // but integrates into a charge difference between the two populations -- a ghost
+    // in the shape of where text has been, growing over a session. Periodic Half is
+    // where inverted output gets its cleanup; it drives every pixel from a complement
+    // seed under the balanced GC waveform instead.
     streamPlane(bus, CMD_DTM1, fb, /*invert=*/true);
   }
   // Consumed: the white-seed (!fast) or the re-drive above already scrubbed any

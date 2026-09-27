@@ -82,11 +82,10 @@ class Uc8279X4Driver : public PanelDriver {
   void requestResync(uint8_t settlePasses) override;
   void skipInitialResync() override;
 
-  // Night mode. Inverted output leaves the black background as the resting
-  // state of every unchanged pixel, and a plain differential never drives it
-  // again -- so the light residue each white->black transition parks there
-  // accumulates as a halo around the text. Honouring the hint re-drives every
-  // pixel on each fast refresh (see _redriveAfterGray, same mechanism).
+  // Night mode. Read by the non-fast seed only: under inverted output a white OLD
+  // plane strands the text in the waveform's no-transition cell, so a dark standing
+  // polarity takes the same complement seed Half uses. The fast path deliberately
+  // does NOT re-drive unchanged pixels -- see displayStart().
   void setBackgroundHint(bool darkBackground) override { _darkBackground = darkBackground; }
 
   // --- 4-level grayscale (anti-aliasing) ---
