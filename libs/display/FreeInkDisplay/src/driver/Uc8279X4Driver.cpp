@@ -431,8 +431,16 @@ bool Uc8279X4Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
 
   streamPlane(bus, CMD_DTM2, fb);
   if (!fast) {
-    if (scrub) {
+    if (scrub || _darkBackground) {
       // Half scrub: OLD = ~target -> every pixel transitions, purging idle charge.
+      //
+      // _darkBackground takes the same seed, and that is the night-mode fix: a
+      // white seed only drives pixels whose target is black, leaving the LIGHT
+      // minority parked in the no-transition cell. Under inverted output that
+      // minority is the text, so every white-seeded GC deposited the current
+      // screen's glyph shapes as idle charge and never drove them out again --
+      // the "previous screen showing through the page" report. The GC waveform
+      // still runs; only the seed changes.
       streamPlane(bus, CMD_DTM1, fb, /*invert=*/true);
     } else {
       // Full flash: seed the OLD plane white across the whole 600-gate scan for

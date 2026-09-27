@@ -73,6 +73,7 @@ class Uc8179Driver : public PanelDriver {
   bool supportsAsyncDisplay() const override { return true; }
 
   void requestResync(uint8_t settlePasses) override;
+  void setBackgroundHint(bool darkBackground) override { _darkBackground = darkBackground; }
   void skipInitialResync() override;
 
   // --- 4-level grayscale (anti-aliasing) ---
@@ -159,6 +160,10 @@ class Uc8179Driver : public PanelDriver {
   // stock's non-flashing XTF_PRE_BW_MID transition instead of DU. Explicit Half
   // remains the complement-driven GC scrub for periodic and sleep cleanup.
   bool _redriveAfterGray = false;
+  // Standing content polarity (night mode). Mirrors Uc8279X4Driver: under a dark
+  // background a white OLD seed strands the light minority in the no-transition
+  // cell, so the seed follows the background instead.
+  bool _darkBackground = false;
   // Tracks whether the first AA page has completed; Factory.bin skips the
   // XTF_PRE_BW_MID pre-pass only for that first page. AA activation itself uses
   // CDI 0x29 every time; 0xA9 is restored only after B/W/preconditioning passes.

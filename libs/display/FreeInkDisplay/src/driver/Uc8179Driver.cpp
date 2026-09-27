@@ -391,9 +391,13 @@ bool Uc8179Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* p
   // NEW plane (0x13) = new frame.
   streamPlane(bus, CMD_DTM2, fb);
   if (!fast) {
-    if (scrub) {
+    if (scrub || _darkBackground) {
       // Charge scrub: target white is driven through BW and target black through
       // WB. No WW/BB pixel is allowed to idle with charge from an older AA page.
+      //
+      // _darkBackground takes the same seed: under inverted output the white seed
+      // leaves the light minority -- the text -- in the no-transition cell, which
+      // is where night-mode ghosting accumulates. Same rule as Uc8279X4Driver.
       streamPlane(bus, CMD_DTM1, fb, /*invert=*/true);
     } else {
       // Full/forced-first flash retains the known absolute-from-white behavior.
