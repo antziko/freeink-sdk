@@ -265,6 +265,19 @@ void Ssd1677Driver::writeRam(EpdBus& bus, uint8_t ramCmd, const uint8_t* data, u
   bus.data(data, static_cast<uint16_t>(size));
 }
 
+void Ssd1677Driver::writeRamInverted(EpdBus& bus, uint8_t ramCmd, const uint8_t* data, const uint32_t size) {
+  uint8_t chunk[128];
+  bus.cmd(ramCmd);
+  bus.beginTxn();
+  for (uint32_t off = 0; off < size;) {
+    const uint32_t n = (size - off) < sizeof(chunk) ? (size - off) : sizeof(chunk);
+    for (uint32_t i = 0; i < n; i++) chunk[i] = static_cast<uint8_t>(~data[off + i]);
+    bus.rawWriteBytes(chunk, static_cast<uint16_t>(n));
+    off += n;
+  }
+  bus.endTxn();
+}
+
 void Ssd1677Driver::refresh(EpdBus& bus, RefreshMode mode, bool turnOff, bool async) {
   _pendingPowerOff = false;
 #if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
@@ -462,7 +475,19 @@ void Ssd1677Driver::displayImpl(EpdBus& bus, const uint8_t* fb, const uint8_t* p
 
   setRamArea(bus, 0, 0, _w, _h);
 
-  if (mode != RefreshMode::Fast) {
+  if (mode == RefreshMode::Half) {
+    // Half is the charge SCRUB, the same contract Uc8279X4Driver and Uc8253X3Driver
+    // implement: OLD (RED) = complement of the target, so EVERY pixel -- the unchanged
+    // background included -- is forced through a transition cell. Seeding OLD = target
+    // here instead left every pixel in the waveform's WW/BB no-transition cell, so a
+    // "scrub" drove nothing and stale charge simply accumulated; on a night-mode panel
+    // sitting at ~90% black that is the whole ghosting mechanism, and it is also why
+    // deepCleanPanel's white phase (which picks HALF precisely to get this seed) could
+    // not clear residue on this controller.
+    writeRam(bus, CMD_WRITE_RAM_BW, fb, _bufferSize);
+    writeRamInverted(bus, CMD_WRITE_RAM_RED, fb, _bufferSize);
+  } else if (mode != RefreshMode::Fast) {
+    // Full: absolute-from-white GC waveform, both planes matched.
     writeRam(bus, CMD_WRITE_RAM_BW, fb, _bufferSize);
     writeRam(bus, CMD_WRITE_RAM_RED, fb, _bufferSize);
   } else {
