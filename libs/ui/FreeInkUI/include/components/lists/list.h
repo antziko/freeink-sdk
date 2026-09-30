@@ -621,6 +621,13 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
       cursorY = static_cast<int16_t>(cursorY + headerH + rowGap);
       continue;
     }
+    // A row is never shorter than rowH, so when even that overflows the band
+    // and partial rows are off, the `partial` test below is certain to break.
+    // Stop before measuring: the measure walks the label's glyphs, which for a
+    // virtualized list whose caller prewarmed only the visible rows means font
+    // loads for a row that is never drawn, on every repaint.
+    if (!props.partialTrailingRow && cursorY + rowH > rowArea.bottom())
+      break;
     const ListRowLayout layout = measureListRow(frame.target(), frame.assets(),
                                                  rowArea.width, props, item);
     const int16_t itemH = layout.height;
