@@ -219,22 +219,14 @@ bool Uc8253X3Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
     triggerRefresh(bus, false, " X3_BW_TARGET_DRF");
   }
 
-  // The _full bank is DC-balanced only when DTM1 holds the frame actually on the glass:
-  // WW/BB are balanced shakes, BW/WB the directional transitions. A white seed reads
-  // every pixel as old-white, so a pixel that stays black takes WB's one-sided drive
-  // instead of BB's shake on every full sync. Seed white only when DTM1 is untrusted.
-  const bool trueOldSeed = doFullSync && _redRamSynced && _initialFullSyncsRemaining == 0 && !_grayState.lsbValid;
   if (doFullSync) {
+    // _full OEM bank from a white DTM1 baseline (no software prev-frame buffer).
     loadBankCdi(bus, 0x29, 0x07, _cfg.full);
-    if (!trueOldSeed) {
-      bus.fillPlane(CMD_DTM1, 0xFF, _h, _wb);
-      bus.cmd(CMD_DATA_STOP);
-    }
+    bus.fillPlane(CMD_DTM1, 0xFF, _h, _wb);
+    bus.cmd(CMD_DATA_STOP);
     bus.sendPlaneFlipped(CMD_DTM2, fb, _h, _wb);
   } else if (doHalfSync) {
-    // _half scrub: WW==BW, WB==BB -> drive every pixel to target ignoring DTM1. This is
-    // the only non-flashing refresh that clears content DTM1 does not describe, e.g. the
-    // pre-reboot frame after a seamless begin(), where DTM1 is white but the glass is not.
+    // _half scrub: WW==BW, WB==BB -> drive every pixel to target ignoring DTM1.
     loadBankCdi(bus, 0xA9, 0x07, _cfg.half);
     bus.sendPlaneFlipped(CMD_DTM2, fb, _h, _wb);
   } else {
@@ -262,7 +254,6 @@ bool Uc8253X3Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
   }
   _pendingTurnOff = turnOff;
   _pendingDoFullSync = doFullSync;
-  _pendingTrueOldSeed = trueOldSeed;
   _pendingFastMode = fastMode;
   _pendingRefresh = true;
   return true;
@@ -299,12 +290,6 @@ void Uc8253X3Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
                           0x00, 0x00, static_cast<uint8_t>(yEnd >> 8), static_cast<uint8_t>(yEnd & 0xFF),
                           0x01};
     loadBankCdi(bus, 0xA9, 0x07, _cfg.normal);  // _normal: OEM normal loader CDI 0xA9
-    // Against a true old frame the transitions are already done; with DTM1 still old the
-    // settle would drive every changed pixel a second time in the same direction.
-    if (_pendingTrueOldSeed) {
-      bus.sendPlaneFlipped(CMD_DTM1, fb, _h, _wb);
-      bus.cmd(CMD_DATA_STOP);
-    }
     for (uint8_t i = 0; i < postConditionPasses; i++) {
       bus.cmd(CMD_PARTIAL_IN);
       bus.cmdData(CMD_PARTIAL_WINDOW, w, 9);

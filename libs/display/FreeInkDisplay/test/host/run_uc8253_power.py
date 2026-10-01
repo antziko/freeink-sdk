@@ -44,13 +44,9 @@ enum class BusyPolarity { X3TwoPhase };
 class EpdBus {
   uint8_t command=0;
 public:
-  std::vector<uint8_t> oldPlane, newPlane, lastBank, lastWw, lastBw, rawRegisters;
-  std::vector<std::vector<uint8_t>> oldAtRefresh;  // DTM1 as each refresh fired
+  std::vector<uint8_t> oldPlane, newPlane, lastBank, rawRegisters;
   unsigned powerOns=0, refreshes=0;
-  void cmd(uint8_t c) {
-    command=c; if(c == 4) ++powerOns;
-    if(c == 0x12) { ++refreshes; oldAtRefresh.push_back(oldPlane); }
-  }
+  void cmd(uint8_t c) { command=c; if(c == 4) ++powerOns; if(c == 0x12) ++refreshes; }
   void cmdData2(uint8_t c, uint8_t a, uint8_t b) { cmd(c); data(a); data(b); }
   void data(uint8_t) {}
   void data(const uint8_t* p, size_t n) {
@@ -58,8 +54,6 @@ public:
       if(command == 0x20) rawRegisters.clear();
       rawRegisters.push_back(command);
       if(command == 0x20) lastBank.assign(p,p+n);
-      if(command == 0x21) lastWw.assign(p,p+n);
-      if(command == 0x22) lastBw.assign(p,p+n);
     }
   }
   void cmdData(uint8_t c, const uint8_t* p, size_t n) { cmd(c); data(p,n); }
@@ -85,7 +79,6 @@ public:
 #include <vector>
 #include <iostream>
 #include "driver/Uc8253X3Driver.h"
-#include "lut/Uc8253X3Luts.h"
 int main() {
  freeink::EpdBus bus; freeink::Uc8253X3Driver d;
  const auto caps = d.grayscaleCapabilities();
@@ -113,32 +106,7 @@ int main() {
    d.display(bus,fb.data(),nullptr,freeink::RefreshMode::Full,false);
    assert(bus.newPlane == fb && bus.oldPlane == fb);
  }
- {
-   // Full sync seeds DTM1 white only while the controller RAM is untrusted.
-   freeink::EpdBus b; freeink::Uc8253X3Driver x;
-   const std::vector<uint8_t> white(792/8*528, 0xFF), a(792/8*528, 0x0F), c(792/8*528, 0xF0);
-   x.begin(b);
-   b.oldAtRefresh.clear();
-   x.display(b,a.data(),nullptr,freeink::RefreshMode::Full,false);
-   assert(b.oldAtRefresh.front() == white);  // boot: panel content unknown
-   x.display(b,a.data(),nullptr,freeink::RefreshMode::Fast,false);
-   b.oldAtRefresh.clear();
-   x.display(b,c.data(),nullptr,freeink::RefreshMode::Full,false);
-   assert(b.oldAtRefresh.front() == a);  // warm: the frame actually displayed
-   assert(b.oldAtRefresh.back() == c);   // trailing settle diffs against itself
-   b.oldAtRefresh.clear();
-   x.requestResync(1);
-   x.display(b,a.data(),nullptr,freeink::RefreshMode::Half,false);
-   assert(b.oldAtRefresh.size() >= 2 && b.oldAtRefresh[0] == c && b.oldAtRefresh[1] == a);
-   const auto ww = freeink::uc8253X3DefaultConfig().fast.ww, bb = freeink::uc8253X3DefaultConfig().fast.bb;
-   assert(ww[0] == 0 && bb[0] == 0);  // unchanged pixels take no FAST drive
-   // HALF scrub stays absolute (WW==BW): it must clear content DTM1 does not describe.
-   x.display(b,c.data(),nullptr,freeink::RefreshMode::Half,false);
-   const auto& half = freeink::uc8253X3DefaultConfig().half;
-   assert(b.lastWw == std::vector<uint8_t>(half.ww, half.ww + 42));
-   assert(b.lastWw == std::vector<uint8_t>(half.bw, half.bw + 42));
- }
- std::cout << "PASS: UC8253 cold power-on, warm Full, power-off/wake, true-old seed\\n";
+ std::cout << "PASS: UC8253 cold power-on, warm Full, and power-off/wake\\n";
 }
 """)
     exe = root / "test_uc8253_power"
