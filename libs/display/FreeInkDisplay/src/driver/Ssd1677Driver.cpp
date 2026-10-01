@@ -476,14 +476,10 @@ void Ssd1677Driver::displayImpl(EpdBus& bus, const uint8_t* fb, const uint8_t* p
   setRamArea(bus, 0, 0, _w, _h);
 
   if (mode == RefreshMode::Half) {
-    // Half is the charge SCRUB, the same contract Uc8279X4Driver and Uc8253X3Driver
-    // implement: OLD (RED) = complement of the target, so EVERY pixel -- the unchanged
-    // background included -- is forced through a transition cell. Seeding OLD = target
-    // here instead left every pixel in the waveform's WW/BB no-transition cell, so a
-    // "scrub" drove nothing and stale charge simply accumulated; on a night-mode panel
-    // sitting at ~90% black that is the whole ghosting mechanism, and it is also why
-    // deepCleanPanel's white phase (which picks HALF precisely to get this seed) could
-    // not clear residue on this controller.
+    // Half runs with CTRL1_BYPASS_RED (see refresh()), so the controller ignores RED and
+    // drives the panel's OTP absolute waveform from the BW plane alone. The complement
+    // written to RED below does not reach the waveform; it is not the charge scrub the
+    // UltraChip drivers build from an OLD-plane seed.
     writeRam(bus, CMD_WRITE_RAM_BW, fb, _bufferSize);
     writeRamInverted(bus, CMD_WRITE_RAM_RED, fb, _bufferSize);
   } else if (mode != RefreshMode::Fast) {
