@@ -127,6 +127,7 @@ private:
   bool _pendingRefresh = false;
   bool _pendingTurnOff = false;
   bool _pendingDoFullSync = false;
+  bool _pendingTrueOldSeed = false;
   bool _pendingFastMode = false;
 };
 
