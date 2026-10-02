@@ -114,9 +114,6 @@ class Ssd1677Driver : public PanelDriver {
   void initController(EpdBus& bus);
   void setRamArea(EpdBus& bus, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
   void writeRam(EpdBus& bus, uint8_t ramCmd, const uint8_t* data, uint32_t size);
-  // Streams the bitwise complement of `data`, in chunks, so seeding the OLD plane for a
-  // charge scrub costs a row buffer rather than a second framebuffer.
-  void writeRamInverted(EpdBus& bus, uint8_t ramCmd, const uint8_t* data, uint32_t size);
   // async: fire MASTER_ACTIVATION and return without waiting on BUSY.
   void refresh(EpdBus& bus, RefreshMode mode, bool turnOff, bool async = false);
   // Blocking CLOCK_ON|ANALOG_ON activation; no-op when already powered.

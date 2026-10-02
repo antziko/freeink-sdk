@@ -265,19 +265,6 @@ void Ssd1677Driver::writeRam(EpdBus& bus, uint8_t ramCmd, const uint8_t* data, u
   bus.data(data, static_cast<uint16_t>(size));
 }
 
-void Ssd1677Driver::writeRamInverted(EpdBus& bus, uint8_t ramCmd, const uint8_t* data, const uint32_t size) {
-  uint8_t chunk[128];
-  bus.cmd(ramCmd);
-  bus.beginTxn();
-  for (uint32_t off = 0; off < size;) {
-    const uint32_t n = (size - off) < sizeof(chunk) ? (size - off) : sizeof(chunk);
-    for (uint32_t i = 0; i < n; i++) chunk[i] = static_cast<uint8_t>(~data[off + i]);
-    bus.rawWriteBytes(chunk, static_cast<uint16_t>(n));
-    off += n;
-  }
-  bus.endTxn();
-}
-
 void Ssd1677Driver::refresh(EpdBus& bus, RefreshMode mode, bool turnOff, bool async) {
   _pendingPowerOff = false;
 #if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
@@ -475,15 +462,10 @@ void Ssd1677Driver::displayImpl(EpdBus& bus, const uint8_t* fb, const uint8_t* p
 
   setRamArea(bus, 0, 0, _w, _h);
 
-  if (mode == RefreshMode::Half) {
-    // Half runs with CTRL1_BYPASS_RED (see refresh()), so the controller ignores RED and
-    // drives the panel's OTP absolute waveform from the BW plane alone. The complement
-    // written to RED below does not reach the waveform; it is not the charge scrub the
-    // UltraChip drivers build from an OLD-plane seed.
-    writeRam(bus, CMD_WRITE_RAM_BW, fb, _bufferSize);
-    writeRamInverted(bus, CMD_WRITE_RAM_RED, fb, _bufferSize);
-  } else if (mode != RefreshMode::Fast) {
-    // Full: absolute-from-white GC waveform, both planes matched.
+  if (mode != RefreshMode::Fast) {
+    // Half and Full run with CTRL1_BYPASS_RED (see refresh()): the panel's OTP absolute
+    // waveform is driven from the BW plane alone. Both planes are written with the target so
+    // the next differential update starts from a matched baseline.
     writeRam(bus, CMD_WRITE_RAM_BW, fb, _bufferSize);
     writeRam(bus, CMD_WRITE_RAM_RED, fb, _bufferSize);
   } else {
