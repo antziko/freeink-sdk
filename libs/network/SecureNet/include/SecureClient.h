@@ -95,8 +95,10 @@ class SecureClient : public Client {
   // number can be attributed. Session tickets cut the TLS leg to ~90ms, at which point
   // the leg that dominates a resumed download's per-hop cost is NOT this class's --
   // without the split there is no way to tell client-side setup from server think time.
-  // tcpConnectMs covers DNS + the TCP SYN exchange (both live inside WiFiClient::connect).
+  // tcpConnectMs covers DNS + the TCP SYN exchange; dnsMs is the name-lookup part of it,
+  // set even when the lookup or the connect then failed.
   uint32_t tcpConnectMs() const { return _tcpMs; }
+  uint32_t dnsMs() const { return _dnsMs; }
   uint32_t tlsHandshakeMs() const { return _tlsMs; }
 
  private:
@@ -120,7 +122,7 @@ class SecureClient : public Client {
   void* _ssl = nullptr;  // WOLFSSL* (opaque to keep wolfSSL headers out of here)
   void* _ctx = nullptr;  // WOLFSSL_CTX*
   bool _connected = false;
-  int _lastReadErr = 0;  // see lastReadError()
+  int _lastReadErr = 0;       // see lastReadError()
   int _lastHandshakeErr = 0;  // see lastHandshakeError()
   // Host of the session currently owned by _ssl, recorded only once the handshake
   // succeeds so that stop() files the session under the right key. A name that does not
@@ -130,6 +132,8 @@ class SecureClient : public Client {
   bool _resumed = false;     // see sessionResumed()
   bool _usedStored = false;  // this connect restored a cached session
   uint32_t _tcpMs = 0;       // see tcpConnectMs()
+  uint32_t _dnsMs = 0;       // see dnsMs()
+  bool _tcpFailed = false;   // the last attempt never opened a socket (DNS or TCP)
   uint32_t _tlsMs = 0;       // see tlsHandshakeMs()
 };
 

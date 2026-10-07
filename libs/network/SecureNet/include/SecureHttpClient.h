@@ -37,10 +37,10 @@
 
 #include <algorithm>
 #include <cctype>
-#include <iterator>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <iterator>
 #include <new>
 #include <string>
 #include <utility>
@@ -261,8 +261,10 @@ class SecureHttpClient {
         } else if (name == "connection") {
           std::string v = value;
           std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(tolower(c)); });
-          if (v.find("close") != std::string::npos) keepAlive = false;
-          else if (v.find("keep-alive") != std::string::npos) keepAlive = true;
+          if (v.find("close") != std::string::npos)
+            keepAlive = false;
+          else if (v.find("keep-alive") != std::string::npos)
+            keepAlive = true;
         }
       }
       if (_aborted) {
@@ -324,6 +326,7 @@ class SecureHttpClient {
   // Phase split of the last https connect; both 0 on a plain-HTTP hop, where the caller's
   // end-to-end figure is all TCP + server think time. See SecureClient::tcpConnectMs().
   uint32_t tcpConnectMs() const { return _secure.tcpConnectMs(); }
+  uint32_t dnsMs() const { return _secure.dnsMs(); }
   uint32_t tlsHandshakeMs() const { return _secure.tlsHandshakeMs(); }
   bool callbackAborted() const { return _callbackAborted; }
   bool aborted() const { return _aborted; }
@@ -479,9 +482,7 @@ class SecureHttpClient {
     return !host.empty() && (scheme == "http" || scheme == "https");
   }
 
-  std::string hostHeader() const {
-    return hostHeaderFor(_scheme, _host, _port);
-  }
+  std::string hostHeader() const { return hostHeaderFor(_scheme, _host, _port); }
 
   static std::string hostHeaderFor(const std::string& scheme, const std::string& host, uint16_t port) {
     const uint16_t defaultPort = scheme == "https" ? 443 : 80;
