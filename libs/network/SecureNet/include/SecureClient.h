@@ -137,6 +137,28 @@ class SecureClient : public Client {
   uint32_t _tlsMs = 0;       // see tlsHandshakeMs()
 };
 
+// Receive-side timing across every SecureClient, for telling a TCP-bound transfer from a
+// TLS-bound one. Raw = ciphertext bytes the transport handed wolfSSL. A gap is the time
+// between two raw reads that carried data; a burst is a run of reads with gaps under
+// RX_BURST_GAP_MS. A window-limited stream shows bursts near the TCP window with ~RTT gaps;
+// a lossy one shows holes of a retransmission timeout. Single-task use only.
+struct TlsRxStats {
+  static constexpr uint32_t RX_BURST_GAP_MS = 20;
+  static constexpr int GAP_BUCKETS = 6;  // <5, <20, <100, <300, <1000, >=1000 ms
+  uint32_t rawBytes = 0;
+  uint32_t rawReads = 0;
+  uint32_t wantRead = 0;  // transport polled with nothing waiting
+  uint32_t gaps[GAP_BUCKETS] = {};
+  uint32_t maxGapMs = 0;
+  uint32_t bursts = 0;
+  uint32_t maxBurstBytes = 0;
+  uint32_t decryptUs = 0;  // inside wolfSSL_read calls that returned plaintext
+  uint32_t maxDecryptUs = 0;
+  uint32_t plainReads = 0;
+};
+void tlsRxStatsReset();
+TlsRxStats tlsRxStats();
+
 // Reusable backing block for wolfSSL's per-record receive buffer.
 //
 // WHY: wolfSSL frees its dynamic input buffer after every record it hands to the

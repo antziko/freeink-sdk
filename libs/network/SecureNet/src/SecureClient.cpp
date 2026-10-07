@@ -44,12 +44,37 @@ int wcSend(WOLFSSL* /*ssl*/, char* buf, int sz, void* ctx) {
   }
   return n;
 }
+TlsRxStats g_rx;
+uint32_t g_rxLastMs = 0;
+uint32_t g_rxBurstBytes = 0;
+
+void noteRawRead(const int n) {
+  const uint32_t now = millis();
+  if (g_rx.rawReads > 0) {
+    const uint32_t gap = now - g_rxLastMs;
+    const int b = gap < 5 ? 0 : gap < 20 ? 1 : gap < 100 ? 2 : gap < 300 ? 3 : gap < 1000 ? 4 : 5;
+    g_rx.gaps[b]++;
+    if (gap > g_rx.maxGapMs) g_rx.maxGapMs = gap;
+    if (gap >= TlsRxStats::RX_BURST_GAP_MS) g_rxBurstBytes = 0;
+  }
+  if (g_rxBurstBytes == 0) g_rx.bursts++;
+  g_rxBurstBytes += static_cast<uint32_t>(n);
+  if (g_rxBurstBytes > g_rx.maxBurstBytes) g_rx.maxBurstBytes = g_rxBurstBytes;
+  g_rx.rawBytes += static_cast<uint32_t>(n);
+  g_rx.rawReads++;
+  g_rxLastMs = now;
+}
+
 int wcRecv(WOLFSSL* /*ssl*/, char* buf, int sz, void* ctx) {
   auto* t = static_cast<WiFiClient*>(ctx);
   if (!t->connected() && t->available() == 0) return WOLFSSL_CBIO_ERR_CONN_CLOSE;
-  if (t->available() == 0) return WOLFSSL_CBIO_ERR_WANT_READ;
+  if (t->available() == 0) {
+    g_rx.wantRead++;
+    return WOLFSSL_CBIO_ERR_WANT_READ;
+  }
   const int n = t->read(reinterpret_cast<uint8_t*>(buf), sz);
   if (n <= 0) return WOLFSSL_CBIO_ERR_WANT_READ;
+  noteRawRead(n);
   return n;
 }
 
@@ -87,6 +112,12 @@ bool isWantIo(const int err) {
   return err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE;
 }
 }  // namespace
+
+void tlsRxStatsReset() {
+  g_rx = TlsRxStats{};
+  g_rxBurstBytes = 0;
+}
+TlsRxStats tlsRxStats() { return g_rx; }
 
 void SecureClient::saveSession() {
   // Called from stop(), i.e. after every read on this session has been made -- which is
@@ -332,8 +363,15 @@ size_t SecureClient::write(const uint8_t* buf, size_t size) {
 int SecureClient::read(uint8_t* buf, size_t size) {
   if (!_connected) return -1;
   auto* ssl = static_cast<WOLFSSL*>(_ssl);
+  const uint32_t startUs = micros();
   const int n = wolfSSL_read(ssl, buf, size);
-  if (n > 0) return n;
+  if (n > 0) {
+    const uint32_t us = micros() - startUs;
+    g_rx.decryptUs += us;
+    if (us > g_rx.maxDecryptUs) g_rx.maxDecryptUs = us;
+    g_rx.plainReads++;
+    return n;
+  }
 
   const int err = wolfSSL_get_error(ssl, n);
   if (isWantIo(err)) return 0;
@@ -511,6 +549,9 @@ uint32_t TlsRecordSlab::misses() { return g_slabMisses; }
 uint32_t TlsRecordSlab::largestMiss() { return g_slabMaxMiss > g_slabMaxOver ? g_slabMaxMiss : g_slabMaxOver; }
 
 #else  // !FREEINK_NET_WOLFSSL — inert stub so the SDK builds without wolfSSL.
+
+void tlsRxStatsReset() {}
+TlsRxStats tlsRxStats() { return {}; }
 
 TlsRecordSlab::TlsRecordSlab() = default;
 TlsRecordSlab::~TlsRecordSlab() = default;
