@@ -19,6 +19,9 @@ SDCardManager::SDCardManager() {}
 
 bool SDCardManager::begin() {
   if (initialized) return true;
+#if FREEINK_DEVICE_METALIO_EINK4
+  if (BoardConfig::isMetalioEInk4() && !freeink::metalio::ensureBooted()) return false;
+#endif
 
   // Native SDMMC: SdFat can't drive SDIO, so mount a plain FsVolume on the esp-idf
   // SDMMC block device. FsFile from this volume is the same type the SPI path
@@ -332,20 +335,36 @@ bool SDCardManager::readFileToStream(const char* path, Print& out, const size_t 
   const bool watchdogWatchesThisTask = (esp_task_wdt_status(nullptr) == ESP_OK);
   uint32_t lastYieldMs = millis();
 
-  while (f.available()) {
-    const int r = f.read(buf, toRead);
+  uint64_t remaining = f.fileSize();
+  while (remaining > 0) {
+    const size_t want = remaining < toRead ? static_cast<size_t>(remaining) : toRead;
+    const int r = f.read(buf, want);
     if (r <= 0) {
-      break;
+      if (Serial) Serial.printf("SDCardManager: incomplete read of %s\n", path);
+      f.close();
+      return false;
     }
-    out.write(buf, static_cast<size_t>(r));
 
-    if (millis() - lastYieldMs >= yieldIntervalMs) {
-      if (watchdogWatchesThisTask) {
-        esp_task_wdt_reset();
+    const size_t count = static_cast<size_t>(r);
+    size_t sent = 0;
+    while (sent < count) {
+      const size_t written = out.write(buf + sent, count - sent);
+      if (written == 0 || written > count - sent) {
+        if (Serial) Serial.printf("SDCardManager: incomplete write while streaming %s\n", path);
+        f.close();
+        return false;
       }
-      vTaskDelay(1);  // let every other task on this core run
-      lastYieldMs = millis();
+      sent += written;
+
+      if (millis() - lastYieldMs >= yieldIntervalMs) {
+        if (watchdogWatchesThisTask) {
+          esp_task_wdt_reset();
+        }
+        vTaskDelay(1);  // let every other task on this core run
+        lastYieldMs = millis();
+      }
     }
+    remaining -= count;
   }
 
   f.close();
@@ -393,19 +412,28 @@ bool SDCardManager::writeFile(const char* path, const String& content) {
     return false;
   }
 
-  if (vol().exists(path)) {
-    vol().remove(path);
-  }
-
+  // Write beside the target and swap in only a complete copy: a short write or
+  // failed flush leaves the previous file untouched, never a truncated one.
+  const String tmp = String(path) + ".tmp";
   FsFile f;
-  if (!openFileForWrite("SD", path, f)) {
-    if (Serial) Serial.printf("Failed to open file for write: %s\n", path);
+  if (!openFileForWrite("SD", tmp.c_str(), f)) {
+    if (Serial) Serial.printf("Failed to open file for write: %s\n", tmp.c_str());
+    return false;
+  }
+  const bool complete = f.print(content) == content.length();
+  if (!f.close() || !complete) {
+    if (Serial) Serial.printf("Short write, keeping previous %s\n", path);
+    vol().remove(tmp.c_str());
     return false;
   }
 
-  const size_t written = f.print(content);
-  f.close();
-  return written == content.length();
+  // ponytail: a power cut between replaceFile's remove and rename leaves only
+  // the complete .tmp; recover it on read if that window ever matters.
+  if (!replaceFile(tmp.c_str(), path)) {
+    vol().remove(tmp.c_str());
+    return false;
+  }
+  return true;
 }
 
 bool SDCardManager::ensureDirectoryExists(const char* path) {
