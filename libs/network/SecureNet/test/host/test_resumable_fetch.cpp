@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <string>
 
 // SecureClient is only reached for https, which these tests avoid (the
 // redirect test proves an https target was stepped down to http).
@@ -129,6 +130,24 @@ int main() {
   from4.startOffset = 4;
   r = get("http://a/f", sink(), from4);
   assert(r.complete && r.bytes == 10 && r.total == 10 && body == "456789" && sentRange(0, "bytes=4-"));
+
+  // A CDN's resume reply carries content-range 18th of 19 headers, past the
+  // 16-header table: the lookup slots must still hold it.
+  {
+    std::string filler;
+    for (int i = 0; i < 17; i++) filler += "X-Filler-" + std::to_string(i) + ": v\r\n";
+    const std::string partial = "HTTP/1.1 206 Partial Content\r\n" + filler +
+                                "Content-Range: bytes 4-9/10\r\nServer: cdn\r\nContent-Length: 6\r\n\r\n456789";
+    reset({partial.c_str()});
+    r = get("http://a/f", sink(), from4);
+    assert(r.complete && r.bytes == 10 && body == "456789");
+
+    const std::string redirect =
+        "HTTP/1.1 302 Found\r\n" + filler + "Location: http://b/g\r\nContent-Length: 0\r\n\r\n";
+    reset({redirect.c_str(), "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"});
+    r = get("http://a/f", sink());
+    assert(r.complete && body == "ok" && FakeNet::hosts()[1] == "b");
+  }
 
   // Redirects are followed, and redirectToHttp steps an https target down.
   reset({"HTTP/1.1 302 Found\r\nLocation: https://b/g\r\nContent-Length: 3\r\n\r\nxyz",

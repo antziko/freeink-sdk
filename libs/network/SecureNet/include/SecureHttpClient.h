@@ -428,8 +428,9 @@ class SecureHttpClient {
   //
   // Dropping past the cap is safe for framing: content-length, transfer-encoding and
   // connection are consumed inline by the parse loop and never read back from this table.
-  // Only getHeader() lookups (in this firmware, "location") can miss, and a missed Location
-  // fails the redirect with an error rather than a panic.
+  // The headers looked up by name -- location (redirects) and content-range (resumed
+  // downloads) -- keep the last slots to themselves, so a server sending many headers
+  // (a CDN's 19, with content-range 18th) cannot crowd them out.
   // True when `s` can take one more character. Probes the next capacity libstdc++ would ask
   // for rather than the single byte, since that is the allocation that actually happens.
   static bool canGrow(const std::string& s) {
@@ -467,6 +468,8 @@ class SecureHttpClient {
   // available — every case on a healthy heap — the probe succeeds and behaviour is unchanged.
   void storeHeader(const std::string& name, const std::string& value) {
     if (_responseHeaders.size() >= _responseHeaders.capacity()) return;
+    const bool lookedUp = name == "location" || name == "content-range";
+    if (!lookedUp && _responseHeaders.size() + LOOKUP_HEADER_SLOTS >= _responseHeaders.capacity()) return;
     if (!canCopy(name) || !canCopy(value)) return;
     _responseHeaders.push_back(Header{name, value});
   }
@@ -699,6 +702,8 @@ class SecureHttpClient {
   // it is the capacity the X3 capture was growing into when it panicked, and several times
   // what the OPDS and sync servers in use here actually send. See storeHeader().
   static constexpr size_t MAX_STORED_HEADERS = 16;
+  // Slots of MAX_STORED_HEADERS held for the headers storeHeader() keeps for lookup.
+  static constexpr size_t LOOKUP_HEADER_SLOTS = 2;
 
   // Kept-alive connection state. _conn points at _secure or _plain while a
   // connection is held open, and null otherwise.
