@@ -91,3 +91,11 @@ class ProtectedBook {
 
 }  // namespace content
 }  // namespace freeink
+
+// Optional host hooks for the 32KB inflate window. Inflating a protected entry
+// needs ~11KB of decoder state plus a 32KB window; a host that keeps a
+// reserved window can lend it here so only the small state rides a fragmented
+// heap. Return nullptr when it is busy; the window is then malloc'd. Every
+// non-null acquire is paired with one release. Undefined hooks mean malloc.
+extern "C" uint8_t* freeink_content_acquire_inflate_window(size_t size) __attribute__((weak));
+extern "C" void freeink_content_release_inflate_window(uint8_t* window) __attribute__((weak));
