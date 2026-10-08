@@ -19,13 +19,13 @@
 
 #ifdef FREEINK_CONTENT_WOLFSSL
 
-#include <wolfssl/wolfcrypt/curve25519.h>
-#include <wolfssl/wolfcrypt/hmac.h>
-#include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/asn.h>
 #include <wolfssl/wolfcrypt/asn_public.h>
+#include <wolfssl/wolfcrypt/curve25519.h>
+#include <wolfssl/wolfcrypt/hmac.h>
 #include <wolfssl/wolfcrypt/pkcs12.h>
+#include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/rsa.h>
 #include <wolfssl/wolfcrypt/sha.h>
 #include <wolfssl/wolfcrypt/sha256.h>
@@ -201,22 +201,34 @@ void WolfsslCrypto::sha256(const uint8_t* data, size_t len, uint8_t out[32]) {
   wc_Sha256Hash(data, static_cast<word32>(len), out);
 }
 
-int32_t WolfsslCrypto::rsaPrivateRaw(const uint8_t* pkcs8Der, size_t pkcs8Len, const uint8_t* in,
-                                     size_t inLen, uint8_t* out, size_t outCap) {
-  if (!rngOk_) return -1;
+int32_t WolfsslCrypto::rsaPrivateRaw(const uint8_t* pkcs8Der, size_t pkcs8Len, const uint8_t* in, size_t inLen,
+                                     uint8_t* out, size_t outCap) {
+  lastError.clear();
+  if (!rngOk_) {
+    lastError = "rng not initialized";
+    return -1;
+  }
   ScopedRsaKey key;
-  if (!key.get()) return -2;
+  if (!key.get()) {
+    lastError = "rsa key alloc failed";
+    return -2;
+  }
   int32_t result = -3;
-  if (decodePrivateKey(pkcs8Der, pkcs8Len, key.get())) {
+  if (!decodePrivateKey(pkcs8Der, pkcs8Len, key.get())) {
+    lastError = "private key decode failed len=" + std::to_string(pkcs8Len);
+  } else {
     word32 outLen = static_cast<word32>(outCap);
     // The raw private op is m^d mod n (used for both request signing and
     // content-key decryption). wc_RsaFunction's `type` is the *_ENCRYPT/_DECRYPT
     // set: RSA_PRIVATE_ENCRYPT==2 is m^d. Do NOT pass RSA_PRIVATE (==1) — that
     // aliases RSA_PUBLIC_DECRYPT and computes m^e with the public exponent,
     // yielding signatures the server rejects as BadPadding.
-    if (wc_RsaFunction(in, static_cast<word32>(inLen), out, &outLen, RSA_PRIVATE_ENCRYPT, key.get(),
-                       &rng_) == 0) {
+    const int rc = wc_RsaFunction(in, static_cast<word32>(inLen), out, &outLen, RSA_PRIVATE_ENCRYPT, key.get(), &rng_);
+    if (rc == 0) {
       result = static_cast<int32_t>(outLen);
+    } else {
+      lastError =
+          "wc_RsaFunction rc=" + std::to_string(rc) + " bits=" + std::to_string(wc_RsaEncryptSize(key.get()) * 8);
     }
   }
   return result;
@@ -456,6 +468,37 @@ bool WolfsslCrypto::aes128CbcEncrypt(const uint8_t key[16], const uint8_t iv[16]
   return wc_AesCbcEncrypt(&aes, out, padded.data(), static_cast<word32>(paddedLen)) == 0;
 }
 
+namespace {
+
+// True when the certificate DER embeds the RSA private key's modulus. That is
+// the key-pair test independent of wolfSSL's own cert parse, which drops a
+// certificate it cannot fully decode even when it is the key's partner.
+bool certHasKeyModulus(const byte* keyDer, word32 keyLen, const byte* certDer, word32 certLen) {
+  // RsaKey and DecodedCert are KB-sized under fast math; keep them off the task stack.
+  auto* rsa = static_cast<RsaKey*>(XMALLOC(sizeof(RsaKey), NULL, DYNAMIC_TYPE_RSA));
+  if (!rsa) return false;
+  if (wc_InitRsaKey(rsa, nullptr) != 0) {
+    XFREE(rsa, NULL, DYNAMIC_TYPE_RSA);
+    return false;
+  }
+  word32 idx = 0;
+  byte e[8];
+  word32 eSz = sizeof(e);
+  std::vector<byte> n(512);
+  word32 nSz = static_cast<word32>(n.size());
+  const bool flat = wc_RsaPrivateKeyDecode(keyDer, &idx, rsa, keyLen) == 0 &&
+                    wc_RsaFlattenPublicKey(rsa, e, &eSz, n.data(), &nSz) == 0;
+  wc_FreeRsaKey(rsa);
+  XFREE(rsa, NULL, DYNAMIC_TYPE_RSA);
+  if (!flat || nSz < 64 || nSz > certLen) return false;
+  for (word32 i = 0; i + nSz <= certLen; ++i) {
+    if (memcmp(certDer + i, n.data(), nSz) == 0) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 bool WolfsslCrypto::pkcs12Extract(const uint8_t* p12, size_t len, const std::string& password,
                                   std::vector<uint8_t>* keyPkcs8, std::vector<uint8_t>* certDer) {
   lastError.clear();
@@ -475,14 +518,45 @@ bool WolfsslCrypto::pkcs12Extract(const uint8_t* p12, size_t len, const std::str
   byte* key = nullptr;
   byte* cert = nullptr;
   word32 keyLen = 0, certLen = 0;
-  const int rc = wc_PKCS12_parse(bundle, password.c_str(), &key, &keyLen, &cert, &certLen, nullptr);
+  WC_DerCertList* others = nullptr;
+  const int rc = wc_PKCS12_parse(bundle, password.c_str(), &key, &keyLen, &cert, &certLen, &others);
   wc_PKCS12_free(bundle);
+
+  // wolfSSL pairs a certificate only when its own cert parse succeeds; fall
+  // back to matching the key's modulus against the remaining certificates.
+  int otherCount = 0;
+  std::string otherInfo;
+  if (rc >= 0 && key && !cert) {
+    for (WC_DerCertList* node = others; node; node = node->next) {
+      ++otherCount;
+      int parseRc = -1;  // not attempted (out of memory)
+      if (auto* decoded = static_cast<DecodedCert*>(XMALLOC(sizeof(DecodedCert), NULL, DYNAMIC_TYPE_DCERT))) {
+        wc_InitDecodedCert(decoded, node->buffer, node->bufferSz, nullptr);
+        parseRc = wc_ParseCert(decoded, CERT_TYPE, NO_VERIFY, nullptr);
+        wc_FreeDecodedCert(decoded);
+        XFREE(decoded, NULL, DYNAMIC_TYPE_DCERT);
+      }
+      const bool match = certHasKeyModulus(key, keyLen, node->buffer, node->bufferSz);
+      otherInfo += " c" + std::to_string(otherCount) + "{len=" + std::to_string(node->bufferSz) +
+                   " parse=" + std::to_string(parseRc) + " n=" + (match ? "1" : "0") + "}";
+      if (match && !cert) {
+        cert = static_cast<byte*>(XMALLOC(node->bufferSz, NULL, DYNAMIC_TYPE_PKCS));
+        if (cert) {
+          memcpy(cert, node->buffer, node->bufferSz);
+          certLen = node->bufferSz;
+        }
+      }
+    }
+  }
+  wc_FreeCertList(others, NULL);
+
   // A bundle missing either bag can parse "successfully" with one output null;
   // free whatever was returned before bailing.
   if (rc < 0 || !key || !cert) {
     // rc<0 with a valid bundle usually means the passphrase is wrong.
     lastError = "wc_PKCS12_parse rc=" + std::to_string(rc) + " keyLen=" + std::to_string(keyLen) +
-                " certLen=" + std::to_string(certLen) + " pwLen=" + std::to_string(password.size());
+                " certLen=" + std::to_string(certLen) + " pwLen=" + std::to_string(password.size()) +
+                " others=" + std::to_string(otherCount) + otherInfo;
     if (key) XFREE(key, NULL, DYNAMIC_TYPE_PUBLIC_KEY);
     if (cert) XFREE(cert, NULL, DYNAMIC_TYPE_PKCS);
     return false;
