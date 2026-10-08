@@ -69,6 +69,12 @@ bool SDCardManager::begin() {
   return initialized;
 }
 
+bool SDCardManager::remount() {
+  _vol.end();  // begin() stops and restarts the SDMMC host itself
+  initialized = false;
+  return begin();
+}
+
 FsBlockDeviceInterface* SDCardManager::rawBlockDevice() { return _dev; }
 
 FsBlockDeviceInterface* SDCardManager::detachFilesystemForRawAccess() {
@@ -200,6 +206,12 @@ bool SDCardManager::begin() {
   }
 
   return initialized;
+}
+
+bool SDCardManager::remount() {
+  sd.end();
+  initialized = false;
+  return begin();
 }
 
 // SdFat's card object already IS a block device: with USE_BLOCK_DEVICE_INTERFACE

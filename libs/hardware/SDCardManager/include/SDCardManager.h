@@ -31,6 +31,9 @@ class SDCardManager {
  public:
   SDCardManager();
   bool begin();
+  // Drop the mounted volume and mount the card again, for a card that stopped
+  // answering mid-session. Open FsFile handles are invalid afterwards.
+  bool remount();
   bool ready() const;
   // Returns the total card capacity in bytes. Cached at begin(); 0 if not mounted.
   uint64_t sdTotalBytes() const;
