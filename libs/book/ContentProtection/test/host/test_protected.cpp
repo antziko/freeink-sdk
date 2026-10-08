@@ -179,6 +179,16 @@ void testInflatedEntry() {
   assert(out == text);
   assert(g_windowLends == 1 && g_windowHeld == 0);
 
+  // A sink that stops early (an image-size probe) is reported as a stop, not
+  // as corrupt content, and the window still comes back.
+  auto stopAfterFirst = [](void* ctx, const uint8_t*, size_t) {
+    int& calls = *static_cast<int*>(ctx);
+    return ++calls < 2;
+  };
+  int calls = 0;
+  assert(!book.decryptEntryToSink(src, crypto, "text/big.xhtml", stopAfterFirst, &calls));
+  assert(calls == 2 && book.lastError() == ProtectedBook::kSinkStoppedError && g_windowHeld == 0);
+
   // Truncated deflate: fails, and the window still comes back.
   std::string cut = storedDeflate(text);
   cut.resize(cut.size() - 100);

@@ -244,7 +244,14 @@ bool ProtectedBook::decryptEntryToSink(ByteSource& source, Crypto& crypto,
   uint8_t* cipher = cipherBuf.get();
   uint8_t* plain = plainBuf.get();
 
-  const auto toSink = [&](const uint8_t* data, size_t size) { return sink && sink(context, data, size); };
+  // A sink that refuses data (a consumer that has read enough) is told apart
+  // from corrupt content in lastError.
+  bool sinkStopped = false;
+  const auto toSink = [&](const uint8_t* data, size_t size) {
+    if (sink && sink(context, data, size)) return true;
+    sinkStopped = true;
+    return false;
+  };
   bool ended = false;
   auto inflateChunk = [&](const uint8_t* data, size_t size, bool last) {
     const bool fed = inflater.feed(data, size, last, toSink);
@@ -254,8 +261,7 @@ bool ProtectedBook::decryptEntryToSink(ByteSource& source, Crypto& crypto,
 
   auto emitChunk = [&](const uint8_t* data, size_t size, bool last) {
     if (!stored) return inflateChunk(data, size, last);
-    if (size > 0 && (!sink || !sink(context, data, size))) return false;
-    return true;
+    return size == 0 || toSink(data, size);
   };
 
   uint32_t remaining = entry->compressedSize - 16;
@@ -296,7 +302,7 @@ bool ProtectedBook::decryptEntryToSink(ByteSource& source, Crypto& crypto,
     }
     if (!emitChunk(plain, plainSize, amount == remaining)) {
       ok = false;
-      lastError_ = stored ? "content sink failed" : "inflate failed";
+      lastError_ = sinkStopped ? kSinkStoppedError : "inflate failed";
       break;
     }
     offset += amount;

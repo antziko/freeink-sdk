@@ -40,6 +40,7 @@ class ProtectedBook {
   // does not count).
   bool isProtected() const { return protected_; }
   const std::string& lastError() const { return lastError_; }
+  static constexpr const char* kSinkStoppedError = "content sink stopped";
 
   // The AES content key: 16 bytes (aes128-cbc schemes) or 32 bytes
   // (aes256-cbc, e.g. Readium LCP). Required before decryptEntryToSink().
@@ -52,6 +53,8 @@ class ProtectedBook {
   // Access + inflate one protected entry, streamed through the sink. The only
   // read path: callers own their buffering, so no whole-entry allocation can
   // hide in here.
+  // A sink returning false stops the entry; lastError() is then
+  // kSinkStoppedError, which a caller reading only a prefix need not log.
   bool decryptEntryToSink(ByteSource& source, Crypto& crypto, const std::string& name,
                           ContentChunkSink sink, void* context);
 
