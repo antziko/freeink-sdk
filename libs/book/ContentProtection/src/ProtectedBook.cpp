@@ -235,14 +235,14 @@ bool ProtectedBook::decryptEntryToSink(ByteSource& source, Crypto& crypto,
     lastError_ = "insufficient memory for content stream";
     return false;
   }
-  std::unique_ptr<uint8_t[]> cipherBuf(new (std::nothrow) uint8_t[kCipherChunk]);
-  std::unique_ptr<uint8_t[]> plainBuf(cipherBuf ? new (std::nothrow) uint8_t[kCipherChunk] : nullptr);
-  if (!plainBuf) {
+  // One buffer, decrypted in place (the Crypto contract allows out == in).
+  std::unique_ptr<uint8_t[]> chunkBuf(new (std::nothrow) uint8_t[kCipherChunk]);
+  if (!chunkBuf) {
     lastError_ = "insufficient memory for content stream";
     return false;
   }
-  uint8_t* cipher = cipherBuf.get();
-  uint8_t* plain = plainBuf.get();
+  uint8_t* cipher = chunkBuf.get();
+  uint8_t* plain = chunkBuf.get();
 
   // A sink that refuses data (a consumer that has read enough) is told apart
   // from corrupt content in lastError.
@@ -274,6 +274,7 @@ bool ProtectedBook::decryptEntryToSink(ByteSource& source, Crypto& crypto,
       lastError_ = "entry read failed";
       break;
     }
+    // Saved before decrypting: the in-place decrypt overwrites the ciphertext.
     uint8_t nextIv[16];
     memcpy(nextIv, cipher + amount - sizeof(nextIv), sizeof(nextIv));
     const bool decrypted = aes256_ ? crypto.aes256CbcDecrypt(bookKey_, iv, cipher, amount, plain)
