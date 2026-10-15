@@ -44,12 +44,13 @@ enum class BusyPolarity { X3TwoPhase };
 class EpdBus {
   uint8_t command=0;
 public:
-  std::vector<uint8_t> oldPlane, newPlane, lastBank, rawRegisters;
+  std::vector<uint8_t> oldPlane, newPlane, lastBank, rawRegisters, cmds, lastWindow;
   unsigned powerOns=0, refreshes=0;
-  void cmd(uint8_t c) { command=c; if(c == 4) ++powerOns; if(c == 0x12) ++refreshes; }
+  void cmd(uint8_t c) { command=c; cmds.push_back(c); if(c == 4) ++powerOns; if(c == 0x12) ++refreshes; }
   void cmdData2(uint8_t c, uint8_t a, uint8_t b) { cmd(c); data(a); data(b); }
   void data(uint8_t) {}
   void data(const uint8_t* p, size_t n) {
+    if(command == 0x90 && n == 9) lastWindow.assign(p,p+n);
     if(n == 42 || n == 49) {
       if(command == 0x20) rawRegisters.clear();
       rawRegisters.push_back(command);
@@ -106,7 +107,24 @@ int main() {
    d.display(bus,fb.data(),nullptr,freeink::RefreshMode::Full,false);
    assert(bus.newPlane == fb && bus.oldPlane == fb);
  }
- std::cout << "PASS: UC8253 cold power-on, warm Full, and power-off/wake\\n";
+ // Windowed FAST: one refresh inside PTIN/PTOUT, the window in gate space, DTM1 synced after.
+ std::vector<uint8_t> fb2(fb); fb2[0] = 0x00;
+ bus.cmds.clear();
+ const auto refreshesBefore = bus.refreshes;
+ d.displayWindow(bus, fb2.data(), nullptr, 16, 8, 32, 16, false);
+ assert(bus.refreshes == refreshesBefore + 1);
+ auto at = [&](uint8_t c) { for (size_t i = 0; i < bus.cmds.size(); i++) if (bus.cmds[i] == c) return int(i); return -1; };
+ assert(at(0x91) >= 0 && at(0x91) < at(0x12) && at(0x12) < at(0x92));
+ assert((bus.lastWindow == std::vector<uint8_t>{0, 16, 0, 47, 504 >> 8, 504 & 0xFF, 519 >> 8, 519 & 0xFF, 1}));
+ assert(bus.newPlane == fb2 && bus.oldPlane == fb2);
+ // A pending resync takes the full path: its first refresh is not windowed (the settle pass
+ // after it opens a full-panel window of its own).
+ d.requestResync(1);
+ bus.cmds.clear();
+ d.displayWindow(bus, fb.data(), nullptr, 16, 8, 32, 16, false);
+ assert(at(0x12) >= 0 && (at(0x91) < 0 || at(0x91) > at(0x12)));
+ assert(bus.newPlane == fb && bus.oldPlane == fb);
+ std::cout << "PASS: UC8253 cold power-on, warm Full, power-off/wake, windowed FAST\\n";
 }
 """)
     exe = root / "test_uc8253_power"

@@ -385,23 +385,10 @@ void Uc8253X3Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, Refres
   _redRamSynced = true;
 }
 
-void Uc8253X3Driver::preconditionGrayscale(EpdBus& bus, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
-  // OEM V5.6.33 "AA-pre-BW(mid)" pass: gentle settle of the displayed BW
-  // frame (DTM1 == DTM2 == frame after display()'s post-refresh DTM1 sync)
-  // that leaves particles receptive to the weak grayscale nudge waveform.
-  // Without it a strong base refresh sets pixels too firmly for the gray
-  // drive to move. Windowed to the gray region via PTL exactly like the OEM
-  // loader (PTIN -> window -> CDI/bank -> refresh -> PTOUT). The PTL Y range
-  // is in GATE space (logical row y lives at gate H-1-y, see
+void Uc8253X3Driver::partialWindowIn(EpdBus& bus, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  // The PTL Y range is in GATE space (logical row y lives at gate H-1-y, see
   // writeGrayscalePlaneStrip); X is byte-aligned outward since PTL horizontal
   // resolution is 8 pixels.
-  if (w == 0 || h == 0 || x >= _w || y >= _h) return;
-  // The settle is only meaningful (and only safe) when both DTM planes hold
-  // the displayed BW frame. Skip when grayscale planes have been written over
-  // them (lsbValid), a grayscale refresh left the RAM unsynced, or the gray
-  // bank is still loaded — firing the mid bank's strong BW/WB drives against
-  // gray-coded state pairs would corrupt the region.
-  if (_inGrayscaleMode || !_redRamSynced || _grayState.lsbValid) return;
   const uint16_t xEndLogical = static_cast<uint16_t>(((x + w - 1) < (_w - 1)) ? (x + w - 1) : (_w - 1));
   const uint16_t yEndLogical = static_cast<uint16_t>(((y + h - 1) < (_h - 1)) ? (y + h - 1) : (_h - 1));
   const uint16_t xs = static_cast<uint16_t>(x & ~7u);
@@ -419,6 +406,48 @@ void Uc8253X3Driver::preconditionGrayscale(EpdBus& bus, uint16_t x, uint16_t y, 
                           0x01};
   bus.cmd(CMD_PARTIAL_IN);
   bus.cmdData(CMD_PARTIAL_WINDOW, win, 9);
+}
+
+void Uc8253X3Driver::displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, uint16_t x, uint16_t y,
+                                   uint16_t w, uint16_t h, bool turnOff) {
+  // A FAST diff limited to the window: pixels outside it are not addressed, so the turbo bank's
+  // one-way top-up of unchanged pixels (WW/BB) reaches only the window instead of the whole page.
+  // Anything the fast path cannot do from a trusted DTM1 baseline takes the full FAST instead.
+  if (!fb || w == 0 || h == 0 || x >= _w || y >= _h || !_redRamSynced || _inGrayscaleMode || _directGrayOnPanel ||
+      !_isScreenOn || _forceFullSyncNext || _initialFullSyncsRemaining > 0 || _grayState.lsbValid) {
+    display(bus, fb, prev, RefreshMode::Fast, turnOff);
+    return;
+  }
+  // The whole plane: outside the window DTM2 equals DTM1 (the caller changed nothing there), so the
+  // window is the only place a transition exists.
+  loadBankCdi(bus, 0x29, 0x07, _cfg.fast);
+  bus.sendPlaneFlipped(CMD_DTM2, fb, _h, _wb);
+  partialWindowIn(bus, x, y, w, h);
+  triggerRefresh(bus, turnOff, " X3_WIN");
+  bus.cmd(CMD_PARTIAL_OUT);
+  // DTM1 mirrors the displayed frame for the next diff.
+  bus.sendPlaneFlipped(CMD_DTM1, fb, _h, _wb);
+  bus.cmd(CMD_DATA_STOP);
+}
+
+void Uc8253X3Driver::preconditionGrayscale(EpdBus& bus, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  // OEM V5.6.33 "AA-pre-BW(mid)" pass: gentle settle of the displayed BW
+  // frame (DTM1 == DTM2 == frame after display()'s post-refresh DTM1 sync)
+  // that leaves particles receptive to the weak grayscale nudge waveform.
+  // Without it a strong base refresh sets pixels too firmly for the gray
+  // drive to move. Windowed to the gray region via PTL exactly like the OEM
+  // loader (PTIN -> window -> CDI/bank -> refresh -> PTOUT). The PTL Y range
+  // is in GATE space (logical row y lives at gate H-1-y, see
+  // writeGrayscalePlaneStrip); X is byte-aligned outward since PTL horizontal
+  // resolution is 8 pixels.
+  if (w == 0 || h == 0 || x >= _w || y >= _h) return;
+  // The settle is only meaningful (and only safe) when both DTM planes hold
+  // the displayed BW frame. Skip when grayscale planes have been written over
+  // them (lsbValid), a grayscale refresh left the RAM unsynced, or the gray
+  // bank is still loaded — firing the mid bank's strong BW/WB drives against
+  // gray-coded state pairs would corrupt the region.
+  if (_inGrayscaleMode || !_redRamSynced || _grayState.lsbValid) return;
+  partialWindowIn(bus, x, y, w, h);
   loadBankCdi(bus, 0xA9, 0x07, _cfg.preBwMid);
   triggerRefresh(bus, /*turnOff=*/false);
   bus.cmd(CMD_PARTIAL_OUT);

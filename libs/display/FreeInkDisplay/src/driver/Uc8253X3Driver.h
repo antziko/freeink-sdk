@@ -61,6 +61,8 @@ class Uc8253X3Driver : public PanelDriver {
   bool displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) override;
   void displayFinish(EpdBus& bus, const uint8_t* fb) override;
   bool supportsAsyncDisplay() const override { return true; }
+  void displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, uint16_t x, uint16_t y, uint16_t w,
+                     uint16_t h, bool turnOff) override;
 
   void beginGrayscale(EpdBus &bus, const uint8_t *fb, GrayscaleMode mode,
                             RefreshMode fallback, bool turnOff) override;
@@ -97,6 +99,8 @@ private:
                    const Uc8253LutBank &bank);
   void triggerRefresh(EpdBus &bus, bool turnOff, const char *label = " X3_DRF");
   void grayWindowIn(EpdBus &bus);
+  // PTIN + PTL window over logical rect (x, y, w, h); the caller sends PTOUT after its refresh.
+  void partialWindowIn(EpdBus& bus, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
   const Uc8253X3Config& _cfg;
 
